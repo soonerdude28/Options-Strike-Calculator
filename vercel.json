@@ -334,6 +334,18 @@
       "schedule": "*/10 21 * * 1-5"
     },
     {
+      "path": "/api/cron/periscope-playbook",
+      "schedule": "30,40,50 13 * * 1-5"
+    },
+    {
+      "path": "/api/cron/periscope-playbook",
+      "schedule": "*/10 14-20 * * 1-5"
+    },
+    {
+      "path": "/api/cron/periscope-playbook",
+      "schedule": "*/10 21 * * 1-5"
+    },
+    {
       "path": "/api/cron/archive-gexbot",
       "schedule": "30 21 * * 2-6"
     },
@@ -370,6 +382,10 @@
     "api/cron/detect-periscope-put-lottery.ts": { "maxDuration": 30 },
     "api/cron/populate-periscope-from-gexbot.ts": { "maxDuration": 30 },
     "api/cron/populate-periscope-from-uw.ts": { "maxDuration": 30 },
+    "api/cron/periscope-playbook.ts": {
+      "maxDuration": 780,
+      "includeFiles": ".claude/skills/**/*.md"
+    },
     "api/cron/detect-gamma-setups.ts": { "maxDuration": 30 },
     "api/cron/backfill-gamma-setup-outcomes.ts": { "maxDuration": 120 },
     "api/cron/check-gamma-setup-drift.ts": { "maxDuration": 30 },

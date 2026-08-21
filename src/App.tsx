@@ -36,6 +36,7 @@ import {
   usePeriscopeExposure,
   type PeriscopeSelectedSlot,
 } from './hooks/usePeriscopeExposure';
+import { usePeriscopePlaybook } from './hooks/usePeriscopePlaybook';
 import { useAccessSession } from './hooks/useAccessSession';
 import { usePanelPrefs } from './hooks/usePanelPrefs';
 import {
@@ -323,10 +324,21 @@ export default function StrikeCalculator() {
     spotHint: market.data.quotes?.spx?.price ?? null,
     selectedSlot: periscopeSlot,
   });
-  // Periscope auto-playbook (Claude) is retired in favor of the
-  // deterministic GEXBot-fed map at /api/periscope-map. Panel renders
-  // the deterministic TradePlanSection only — the prose layer and the
-  // usePeriscopePlaybook hook have been removed.
+  // Claude's auto-playbook, revived 2026-08-21 on top of the Unusual
+  // Whales data layer (docs/superpowers/specs/periscope-playbook-revival-2026-08-21.md).
+  // Runs alongside the deterministic map rather than replacing it. When
+  // viewing a historical slot, pass its date so the playbook lookup
+  // mirrors the time-travel selection, and pin to the rendered exposure
+  // view's `capturedAt` so prev/next on the time picker refetches the
+  // matching playbook (otherwise the API returns the latest debrief row
+  // regardless of which slot the panel is showing). Polling is gated on
+  // marketOpen inside the hook and pauses entirely on a historical pick.
+  const periscopePlaybook = usePeriscopePlaybook({
+    marketOpen: market.data.quotes?.marketOpen ?? false,
+    selectedDate: periscopeSlot?.date ?? null,
+    selectedSlotCapturedAt:
+      periscopeSlot != null ? (periscope.view?.capturedAt ?? null) : null,
+  });
   // GEX Landscape owns its own date / scrub state internally and pulls
   // MM-attributed per-strike data via `useGexLandscapeData` →
   // `/api/periscope-strikes` (with a WS side channel for vol
@@ -1196,6 +1208,7 @@ export default function StrikeCalculator() {
                 availableSlots={periscope.availableSlots}
                 selectedSlot={periscopeSlot}
                 onSelectSlot={setPeriscopeSlot}
+                playbook={periscopePlaybook}
               />
             </GatedSection>
           ),
@@ -1387,6 +1400,7 @@ export default function StrikeCalculator() {
       market,
       multiplier,
       periscope,
+      periscopePlaybook,
       periscopeSlot,
       portfolioRiskThresholdPct,
       results,

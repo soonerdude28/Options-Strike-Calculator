@@ -18,6 +18,7 @@ import { Sentry } from './sentry.js';
 import logger from './logger.js';
 import { parseTrailingJsonBlock } from './json-fence.js';
 import { NO_ALERTS_SENTINEL } from './periscope-flow-context.js';
+import type { PeriscopeSnapshotSource } from './periscope-query.js';
 import type {
   ParentChainRow,
   PeriscopeBias,
@@ -34,6 +35,11 @@ import type {
  * Build the user message content blocks: a small text preamble
  * (mode + linkage) followed by labelled image blocks. Periscope
  * screenshots are PNG/JPEG/GIF/WEBP base64.
+ *
+ * NOTE — the live auto-playbook runner is DB-driven and always passes
+ * `images: []`; the image path survives only for manual/legacy callers.
+ * The mode bodies below are therefore written for a no-chart payload
+ * (see {@link NO_CHART_PREAMBLE}).
  *
  * In debrief mode, when `parentRead` is supplied the parent's prose +
  * structured fields are inlined into the preamble. Without this Claude
@@ -211,6 +217,52 @@ export function formatParentChainBlock(
 }
 
 /**
+ * Per-source scale note. `periscope_snapshots` carries three series on
+ * mutually incompatible scales (migration #191):
+ *
+ *   - `uw_spot` — RAW DOLLAR exposure, ~1000x LARGER than the scale
+ *     every worked example / magnitude band in
+ *     `.claude/skills/periscope/SKILL.md` was calibrated on.
+ *   - `uw_eod` — UW's NORMALIZED greek exposure, ~1000x smaller than
+ *     `uw_spot`, and exactly ONE synthetic 15:00-CT slice per day.
+ *   - `gexbot` — the retired legacy feed; normalized, and dead.
+ *
+ * Without this note Claude reads raw-dollar magnitudes against a
+ * normalized mental model and misjudges the whole gamma landscape.
+ */
+const HEAT_MAP_SCALE_NOTES: Record<PeriscopeSnapshotSource, string> = {
+  uw_spot:
+    "RAW DOLLAR greek exposure from the Unusual Whales live spot feed — roughly 1000x LARGER than the normalized heat-map scale the periscope skill's worked examples and magnitude bands were calibrated on.",
+  uw_eod:
+    'Unusual Whales\' NORMALIZED end-of-day greek exposure — roughly 1000x SMALLER than the raw-dollar uw_spot series. This series has exactly ONE synthetic 15:00-CT slice per trading day, so anything you might treat as a "prior slice" is YESTERDAY, not ten minutes ago; make no intraday-momentum claim from it.',
+  gexbot:
+    'the retired GEXBot normalized series — same normalized scale family as the skill, but the feed is dead so the values may be stale.',
+};
+
+/**
+ * Units / scale directive that precedes the strike listings.
+ *
+ * VOLATILE placement, deliberately: this text lives in the per-slot
+ * user content (not the cached system prefix) because `source` can
+ * change between slots — `resolveSnapshotSource` falls back
+ * `uw_spot -> uw_eod` when the expiry has no live rows. Putting it in
+ * a static block would either bake in the wrong scale or invalidate
+ * the 1h-TTL cached prefix whenever the source changed.
+ */
+function formatScaleDirective(
+  source: PeriscopeSnapshotSource | null,
+): string[] {
+  const note =
+    source == null
+      ? 'of an UNRESOLVED source series — treat every magnitude as unverified.'
+      : HEAT_MAP_SCALE_NOTES[source];
+  return [
+    `UNITS / SCALE — source=${source ?? 'unknown'}. These values are ${note}`,
+    'CONSEQUENCE: IGNORE every absolute-magnitude sanity check in the periscope skill, including the "0DTE charm runs ±60K–120K" band and the magnitudes in its worked examples. Do NOT judge a number as "too big" or "too small" against them, and do NOT rescale or convert the values yourself. What REMAINS VALID is relative structure only: signs (+γ vs −γ), strike-to-strike rankings, ratios between strikes, and where the clusters sit relative to spot. Quote magnitudes exactly as printed below.',
+  ];
+}
+
+/**
  * Format a heat-map extraction result as a user-content text block.
  * Returns null when both metric arrays are empty so the caller can
  * skip the injection entirely.
@@ -218,16 +270,23 @@ export function formatParentChainBlock(
  * The block is labeled clearly so Claude knows the values are MM-
  * attributed Net GEX / Net Charm from UW (not naive). Color is
  * implied by the value's sign and elided to keep the block compact.
+ *
+ * `source` is REQUIRED (nullable, never omittable) so a caller cannot
+ * silently ship magnitudes with no units attached — see
+ * {@link formatScaleDirective}.
  */
 export function formatHeatMapBlock(args: {
   gex: Array<{ strike: number; value: number }>;
   charm: Array<{ strike: number; value: number }>;
+  source: PeriscopeSnapshotSource | null;
 }): string | null {
-  const { gex, charm } = args;
+  const { gex, charm, source } = args;
   if (gex.length === 0 && charm.length === 0) return null;
 
   const lines: string[] = [
     '[Heat-map extracted strikes (MM-attributed Net GEX / Net Charm from UW)]',
+    '',
+    ...formatScaleDirective(source),
   ];
 
   if (gex.length > 0) {
@@ -255,20 +314,115 @@ function formatSigned(n: number): string {
 }
 
 /**
+ * Data-provenance preamble shared by all three modes.
+ *
+ * The auto-playbook runner calls with `images: []` — it is entirely
+ * DB-driven via `synthesizeFromDb`. The prior wording ("the chart in
+ * front of you", "positions levels") was written for the retired
+ * screenshot/OCR era and, with no image blocks present, is a direct
+ * invitation to hallucinate Positions bars, prior-slice dots and
+ * candle-chart price action that are not in the payload.
+ *
+ * The Positions panel is PERMANENTLY unavailable: no Unusual Whales
+ * exposure endpoint serves one and `PanelName` is only
+ * 'gamma' | 'charm' | 'vanna'. So requests for it are removed rather
+ * than softened.
+ *
+ * VOLATILE placement: this rides in the per-read user content, not the
+ * static system blocks, so it costs nothing against the 1h-TTL cached
+ * prefix (~33-70K tokens) and stays byte-identical for cache purposes.
+ */
+const NO_CHART_PREAMBLE: readonly string[] = [
+  'THERE IS NO CHART AND NO SCREENSHOT IN THIS REQUEST. You are reading headless off the database: every figure available to you appears as typed text in the blocks below (spot directive, heat-map extracted strikes, flow context, parent chain). Do not describe, cite, or infer anything visual — no bars, no dots, no colors, no candle chart, no drawn cone.',
+  'The Positions panel is NOT available and never will be — the data source serves no positions series. Do NOT report Positions levels or clusters, and do NOT attempt the Positions-vs-Gamma cross-check the skill describes. Prior-slice dots are likewise unavailable: any momentum or sign-flip claim must be sourced from the parent-chain block, not from an imagined dot.',
+  'Only Net GEX (gamma) and Net Charm strikes are supplied. Vanna is NOT supplied — do not invent vanna readings; treat vol-shock exposure as unknown.',
+];
+
+/**
+ * Confidence cap for criteria that cannot be checked against the data
+ * actually supplied. SKILL.md's `high` bar (SKILL.md:469-472) requires
+ * twin-strike confluence cross-checked against Positions, the
+ * `key_levels.magnet` rule (SKILL.md:218) cross-checks Positions, and
+ * the self-igniting-expiry-unwind read (SKILL.md:288-300) needs both
+ * Positions bars and prior-slice dots. None of that exists here.
+ *
+ * VOLATILE placement, for the same reason as NO_CHART_PREAMBLE — and
+ * specifically NOT in `STRUCTURED_TOOL`, because `tools` renders before
+ * `system` and any schema edit would invalidate the entire cached
+ * prefix.
+ */
+const CONFIDENCE_CAP_GUIDANCE: readonly string[] = [
+  'CONFIDENCE CAP. Do NOT claim "high" confidence on any criterion you cannot actually verify with the data supplied above. In particular the skill\'s "high" bar (twin-strike +γ confluence cross-checked against Positions) and its self-igniting expiry-unwind read both require the Positions panel and prior-slice dots, neither of which is available — so those checks are UNAVAILABLE, not "passed". When a required check is unavailable, cap at "medium" (or "low" when structure is fragile) and name the missing check explicitly in confidence_basis, e.g. "Positions cross-check unavailable — panel not served by this data source". Silently treating an unverifiable criterion as satisfied is a verification failure.',
+];
+
+/**
+ * Debrief-only instruction that closes the lessons loop.
+ *
+ * `periscope-lessons.ts` extracts curation candidates by keying on a
+ * `## What to add to the model` heading in the debrief prose
+ * (HEADING_REGEX at periscope-lessons.ts:125). No live prompt has ever
+ * asked for that heading, which is why `curate-periscope-lessons` has
+ * always been a no-op. The heading below is emitted on its OWN LINE and
+ * must stay character-for-character compatible with that regex —
+ * `api/__tests__/periscope-prompts.test.ts` asserts it by running the
+ * real extractor over this instruction's heading rather than a copied
+ * literal, so the two cannot drift.
+ *
+ * ## The ordering is load-bearing
+ *
+ * The section must be written in PROSE and BEFORE the
+ * {@link STRUCTURED_TOOL_NAME} tool call. A `tool_use` block TERMINATES
+ * the assistant turn (`stop_reason: 'tool_use'`) and
+ * `runCachedAnthropicCall` is single-shot — it concatenates the text
+ * blocks of ONE `finalMessage()` and never continues the turn. So an
+ * instruction to write the lessons "after the required structured
+ * output" (what this said until 2026-08-21) generates nothing at all:
+ * `prose_text` never carries the heading, `extractCandidatesViaRegex`
+ * finds no candidates, and `curate-periscope-lessons` stays the exact
+ * no-op this instruction exists to fix.
+ *
+ * A function rather than a `const` array so it can interpolate
+ * {@link STRUCTURED_TOOL_NAME} — declared further down this module —
+ * without a temporal-dead-zone error at module init. Naming the tool
+ * from the constant means a rename cannot silently desynchronise the
+ * ordering rule from the tool it is about.
+ *
+ * VOLATILE placement: debrief-only, so it must not enter the static
+ * system prefix shared by all three modes.
+ */
+function buildLessonsSectionInstruction(): string[] {
+  return [
+    `LESSONS SECTION — REQUIRED. Write it in your PROSE, and write it BEFORE you call the \`${STRUCTURED_TOOL_NAME}\` tool.`,
+    `WHY THE ORDER MATTERS: calling \`${STRUCTURED_TOOL_NAME}\` ENDS YOUR TURN. Nothing you intend to write after that tool call is ever generated, so a lessons section placed after it is silently lost and the curation pipeline receives nothing. This ordering overrides any placement the skill or its worked examples imply.`,
+    'Required response order: (1) the scoring narrative, (2) the lessons section described here — the LAST prose you write, (3) the tool call, with nothing after it.',
+    '',
+    'Open the lessons section with this heading verbatim, on its own line:',
+    '',
+    '## What to add to the model',
+    '',
+    'Under that heading, write 1-4 `-` bullets. Each bullet must be ONE self-contained, reusable lesson stated so it is useful on a future day with different numbers — the mechanism and the condition it fires under, not today\'s price. Bad: "7,250 held". Good: "A +γ cluster that survives two consecutive slices without shrinking held as an intraday floor; a cluster that halved between slices did not." If the session produced nothing transferable, still emit the heading and say so in a single bullet.',
+  ];
+}
+
+/**
  * Pre-trade preamble. No parent context — this is the day's first read,
  * forward-looking, prior to any intraday price action. Hindsight is
- * forbidden in the same way as intraday; only price visible up to
- * read_time on the chart counts.
+ * forbidden in the same way as intraday; only data timestamped at or
+ * before read_time counts.
  */
 function buildPreTradeModeBody(): string[] {
   return [
-    'YOU ARE IN PRE-TRADE MODE. Produce the day playbook BEFORE the open: setup → structural map → charm flow tally → trade thesis with bilateral triggers (long + short, stops, targets, R:R, no-trade zone) → regime label → the required JSON block at the very end.',
+    `YOU ARE IN PRE-TRADE MODE. Produce the day playbook BEFORE the open: setup → structural map → charm flow tally → trade thesis with bilateral triggers (long + short, stops, targets, R:R, no-trade zone) → regime label. Then call the \`${STRUCTURED_TOOL_NAME}\` tool LAST — that call ends your turn, so write every part of the prose above before it.`,
+    '',
+    ...NO_CHART_PREAMBLE,
     '',
     'No prior intraday reads exist for today — there is no chain to reconcile against. Treat this as a fresh forward-looking read.',
     '',
-    'DO NOT include any worked-example outcomes, "the day delivered", settlement values, ✓ check-marks, "what triggered", "what actually happened", or any hindsight scoring. Stop the response after the JSON block.',
+    ...CONFIDENCE_CAP_GUIDANCE,
     '',
-    "If the chart's date or structure resembles a worked example in the skill, treat this as a fresh real-time read. The user already knows the worked-example outcomes — do not repeat them.",
+    `DO NOT include any worked-example outcomes, "the day delivered", settlement values, ✓ check-marks, "what triggered", "what actually happened", or any hindsight scoring. The \`${STRUCTURED_TOOL_NAME}\` tool call is the last thing you emit; nothing after it is generated.`,
+    '',
+    "If today's date or structure resembles a worked example in the skill, treat this as a fresh real-time read. The user already knows the worked-example outcomes — do not repeat them.",
   ];
 }
 
@@ -279,19 +433,23 @@ function buildPreTradeModeBody(): string[] {
  */
 function buildIntradayModeBody(): string[] {
   return [
-    'YOU ARE IN INTRADAY MODE. Produce a forward-looking thesis-maintenance read of the chart in front of you. Output ONLY:',
+    'YOU ARE IN INTRADAY MODE. Produce a forward-looking thesis-maintenance read of the slice supplied below. Output ONLY:',
     '  - Setup at slice end (current spot + immediate context)',
-    '  - Structural map (gamma + charm + positions levels)',
+    '  - Structural map (gamma + charm levels from the supplied heat-map strikes)',
     '  - Charm flow tally → directional bias',
     '  - Trade thesis with bilateral triggers (long + short), stops, targets, R:R, no-trade zone',
     '  - Regime label',
-    '  - The required JSON block at the very end',
+    `  - Then the \`${STRUCTURED_TOOL_NAME}\` tool call, LAST — it ends your turn`,
     '',
-    "Reconcile against the parent chain. If you reverse the chain's bias, state the structural reason explicitly (a specific gamma / charm / positions change in this slice). Do NOT silently invert.",
+    ...NO_CHART_PREAMBLE,
     '',
-    'DO NOT include any "## Debrief", "what triggered", "what actually happened", "the day delivered", settlement values, ✓ check-marks, or any hindsight scoring. Stop the response after the JSON block.',
+    "Reconcile against the parent chain. If you reverse the chain's bias, state the structural reason explicitly (a specific gamma or charm change in this slice versus the chain). Do NOT silently invert.",
     '',
-    "If the chart's date or structure resembles a worked example in the skill, treat this as a fresh real-time read. The user already knows the worked-example outcomes — do not repeat them.",
+    ...CONFIDENCE_CAP_GUIDANCE,
+    '',
+    `DO NOT include any "## Debrief", "what triggered", "what actually happened", "the day delivered", settlement values, ✓ check-marks, or any hindsight scoring. The \`${STRUCTURED_TOOL_NAME}\` tool call is the last thing you emit; nothing after it is generated.`,
+    '',
+    "If today's date or structure resembles a worked example in the skill, treat this as a fresh real-time read. The user already knows the worked-example outcomes — do not repeat them.",
   ];
 }
 
@@ -307,7 +465,13 @@ function buildDebriefModeBody(
   parent: PeriscopeParentRead | null | undefined,
 ): string[] {
   const head = [
-    'YOU ARE IN DEBRIEF MODE. Score the open read below against actual price action visible in the candle chart. Honest facts only — no retroactive justification.',
+    'YOU ARE IN DEBRIEF MODE. Score the open read below against the actual session outcome recorded in the database — the authoritative spot in the spot directive block, the end-of-day heat-map strikes, and the parent chain. Honest facts only — no retroactive justification.',
+    '',
+    ...NO_CHART_PREAMBLE,
+    '',
+    ...CONFIDENCE_CAP_GUIDANCE,
+    '',
+    ...buildLessonsSectionInstruction(),
   ];
   if (parent == null) return head;
 

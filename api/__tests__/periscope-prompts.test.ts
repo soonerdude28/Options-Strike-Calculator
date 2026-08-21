@@ -20,6 +20,13 @@ vi.mock('../_lib/logger.js', () => ({
   },
 }));
 
+// periscope-lessons imports db.js at module scope; the lessons-heading
+// test below only needs its pure regex extractor, so stub the DB out.
+vi.mock('../_lib/db.js', () => ({
+  getDb: vi.fn(() => vi.fn(async () => [])),
+  withDbRetry: <T>(fn: () => Promise<T>): Promise<T> => fn(),
+}));
+
 import {
   buildUserContent,
   formatHeatMapBlock,
@@ -31,6 +38,8 @@ import {
   synthesizeStructuralProse,
 } from '../_lib/periscope-prompts.js';
 import { NO_ALERTS_SENTINEL } from '../_lib/periscope-flow-context.js';
+import { extractCandidatesViaRegex } from '../_lib/periscope-lessons.js';
+import type { PeriscopeMode } from '../_lib/periscope-db.js';
 import type { PeriscopeStructuredFields } from '../_lib/periscope-db.js';
 
 /** Build a PeriscopeStructuredFields with a few overrides — the rest null/[]. */
@@ -824,11 +833,14 @@ describe('formatParentChainBlock', () => {
 
 describe('formatHeatMapBlock', () => {
   it('returns null when both gex and charm arrays are empty', () => {
-    expect(formatHeatMapBlock({ gex: [], charm: [] })).toBeNull();
+    expect(
+      formatHeatMapBlock({ gex: [], charm: [], source: 'uw_spot' }),
+    ).toBeNull();
   });
 
   it('emits only the Net GEX section when charm is empty', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [{ strike: 7250, value: 1500 }],
       charm: [],
     });
@@ -844,6 +856,7 @@ describe('formatHeatMapBlock', () => {
 
   it('emits only the Net Charm section when gex is empty', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [],
       charm: [{ strike: 7260, value: -2000 }],
     });
@@ -859,6 +872,7 @@ describe('formatHeatMapBlock', () => {
 
   it('emits both sections with a blank line between when both are populated', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [{ strike: 7250, value: 1500 }],
       charm: [{ strike: 7260, value: -2000 }],
     });
@@ -876,6 +890,7 @@ describe('formatHeatMapBlock', () => {
 
   it('uses the exact header line for the heat-map block', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [{ strike: 7250, value: 1 }],
       charm: [],
     });
@@ -887,6 +902,7 @@ describe('formatHeatMapBlock', () => {
 
   it('renders strike lines with 2-space indent and "{strike}: {signed-value}" form', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [{ strike: 7250, value: 1500 }],
       charm: [],
     });
@@ -895,6 +911,7 @@ describe('formatHeatMapBlock', () => {
 
   it('prefixes positive numbers with + via formatSigned', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [{ strike: 7250, value: 1234567 }],
       charm: [],
     });
@@ -903,6 +920,7 @@ describe('formatHeatMapBlock', () => {
 
   it('renders negative numbers with a leading minus from toLocaleString', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [{ strike: 7260, value: -2500 }],
       charm: [],
     });
@@ -913,6 +931,7 @@ describe('formatHeatMapBlock', () => {
 
   it('renders zero as bare "0" (no leading + or -)', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [{ strike: 7250, value: 0 }],
       charm: [],
     });
@@ -925,6 +944,7 @@ describe('formatHeatMapBlock', () => {
 
   it('emits one strike line per entry in input order', () => {
     const out = formatHeatMapBlock({
+      source: 'uw_spot',
       gex: [
         { strike: 7250, value: 1500 },
         { strike: 7260, value: 800 },
@@ -1082,5 +1102,330 @@ describe('buildUserContent — optional text block injections', () => {
         images: [],
       }),
     ).toThrow(/Unknown periscope mode: made_up_mode/);
+  });
+});
+
+// ============================================================
+// DB-driven revival guards (Phase 2 of
+// docs/superpowers/specs/periscope-playbook-revival-2026-08-21.md).
+//
+// The auto-playbook runs with `images: []` and is fed entirely by
+// synthesizeFromDb. These tests lock in the four fixes: units on the
+// heat-map magnitudes, no screenshot-era language in the mode bodies,
+// the confidence cap for unverifiable criteria, and the lessons
+// heading that periscope-lessons.ts keys its extraction on.
+// ============================================================
+
+/** Pull the first text block (the mode preamble) for a mode. */
+function modeBody(mode: PeriscopeMode): string {
+  const blocks = buildUserContent({ mode, parentId: null, images: [] });
+  return (blocks[0] as { type: 'text'; text: string }).text;
+}
+
+const ALL_MODES: PeriscopeMode[] = ['pre_trade', 'intraday', 'debrief'];
+
+describe('formatHeatMapBlock — units / scale directive', () => {
+  const args = { gex: [{ strike: 7250, value: 1500 }], charm: [] };
+
+  it('names the resolved source in the units line', () => {
+    for (const source of ['uw_spot', 'uw_eod', 'gexbot'] as const) {
+      const out = formatHeatMapBlock({ ...args, source });
+      expect(out).not.toBeNull();
+      expect(out!).toContain(`UNITS / SCALE — source=${source}`);
+    }
+  });
+
+  it('flags uw_spot as RAW DOLLAR and ~1000x larger than the skill scale', () => {
+    const out = formatHeatMapBlock({ ...args, source: 'uw_spot' })!;
+    expect(out).toContain('RAW DOLLAR');
+    expect(out).toContain('1000x LARGER');
+  });
+
+  it('flags uw_eod as normalized, smaller, and one slice per day', () => {
+    const out = formatHeatMapBlock({ ...args, source: 'uw_eod' })!;
+    expect(out).toContain('NORMALIZED');
+    expect(out).toContain('1000x SMALLER');
+    // The "prior slice" of a once-a-day series is yesterday — the model
+    // must not read it as 10-minute momentum.
+    expect(out).toMatch(/YESTERDAY/);
+  });
+
+  it('flags gexbot as the retired normalized legacy series', () => {
+    const out = formatHeatMapBlock({ ...args, source: 'gexbot' })!;
+    expect(out).toContain('GEXBot');
+    expect(out).toContain('normalized');
+  });
+
+  it('treats an unresolved source as unverified rather than silently omitting units', () => {
+    const out = formatHeatMapBlock({ ...args, source: null })!;
+    expect(out).toContain('UNITS / SCALE — source=unknown');
+    expect(out).toContain('unverified');
+  });
+
+  it('tells the model to ignore the skill absolute-magnitude checks but keep relative structure', () => {
+    const out = formatHeatMapBlock({ ...args, source: 'uw_spot' })!;
+    expect(out).toContain('IGNORE every absolute-magnitude sanity check');
+    // The specific band the skill hard-codes (SKILL.md:381).
+    expect(out).toContain('±60K–120K');
+    // Relative structure survives.
+    expect(out).toContain('signs');
+    expect(out).toContain('rankings');
+  });
+
+  it('keeps the units directive above the strike listings but below the header', () => {
+    const out = formatHeatMapBlock({
+      gex: [{ strike: 7250, value: 1500 }],
+      charm: [{ strike: 7260, value: -2000 }],
+      source: 'uw_spot',
+    })!;
+    const lines = out.split('\n');
+    expect(lines[0]).toBe(
+      '[Heat-map extracted strikes (MM-attributed Net GEX / Net Charm from UW)]',
+    );
+    const unitsIdx = lines.findIndex((l) => l.startsWith('UNITS / SCALE'));
+    const firstStrikeIdx = lines.findIndex((l) => /^ {2}\d+:/.test(l));
+    expect(unitsIdx).toBeGreaterThan(0);
+    expect(firstStrikeIdx).toBeGreaterThan(unitsIdx);
+  });
+
+  it('still returns null when both metric arrays are empty (no orphan units block)', () => {
+    expect(
+      formatHeatMapBlock({ gex: [], charm: [], source: 'uw_spot' }),
+    ).toBeNull();
+  });
+});
+
+describe('mode bodies — no screenshot-era language', () => {
+  it('never asks for Positions data (permanently unavailable from UW)', () => {
+    for (const mode of ALL_MODES) {
+      const body = modeBody(mode);
+      // The only permitted mentions are the explicit prohibitions.
+      const positionsLines = body
+        .split('\n')
+        .filter((l) => /positions/i.test(l));
+      expect(positionsLines.length).toBeGreaterThan(0);
+      for (const line of positionsLines) {
+        expect(line).toMatch(/NOT available|Do NOT|unavailable/i);
+      }
+      expect(body).not.toContain('positions levels');
+      expect(body).not.toContain('/ positions ');
+    }
+  });
+
+  it('never refers to a chart, screenshot, candle chart, bars or dots as a source', () => {
+    for (const mode of ALL_MODES) {
+      const body = modeBody(mode);
+      expect(body).not.toContain('the chart in front of you');
+      expect(body).not.toContain("chart's date");
+      expect(body).not.toContain('candle chart.');
+      expect(body).not.toContain('visible in the candle chart');
+    }
+  });
+
+  it('states up front that there is no chart and every figure comes from the DB', () => {
+    for (const mode of ALL_MODES) {
+      const body = modeBody(mode);
+      expect(body).toContain('THERE IS NO CHART AND NO SCREENSHOT');
+      expect(body).toContain('database');
+    }
+  });
+
+  it('declares vanna and prior-slice dots unavailable', () => {
+    for (const mode of ALL_MODES) {
+      const body = modeBody(mode);
+      expect(body).toContain('Vanna is NOT supplied');
+      expect(body).toContain('Prior-slice dots are likewise unavailable');
+    }
+  });
+});
+
+describe('mode bodies — confidence capping on unverifiable criteria', () => {
+  it('forbids "high" on checks the supplied data cannot verify, in every mode', () => {
+    for (const mode of ALL_MODES) {
+      const body = modeBody(mode);
+      expect(body).toContain('CONFIDENCE CAP');
+      expect(body).toMatch(/Do NOT claim "high" confidence/);
+      expect(body).toContain('twin-strike');
+      expect(body).toContain('expiry-unwind');
+      expect(body).toContain('confidence_basis');
+    }
+  });
+
+  it('tells the model to name the unavailable check rather than assume it passed', () => {
+    const body = modeBody('intraday');
+    expect(body).toContain('UNAVAILABLE, not "passed"');
+    expect(body).toContain('Positions cross-check unavailable');
+  });
+});
+
+describe('buildDebriefModeBody — lessons-curation heading', () => {
+  /**
+   * The debrief body must instruct a heading that
+   * periscope-lessons.ts's HEADING_REGEX actually matches. Rather than
+   * copying the literal (which could drift), pull the heading line the
+   * prompt emits and run the REAL extractor over a synthetic debrief
+   * that uses it.
+   */
+  function instructedHeading(): string {
+    const body = modeBody('debrief');
+    const heading = body.split('\n').find((l) => /^#{1,6}\s/.test(l));
+    expect(heading).toBeDefined();
+    return heading!;
+  }
+
+  it('instructs a markdown heading on its own line', () => {
+    expect(instructedHeading()).toMatch(/^#{1,6}\s+\S/);
+  });
+
+  it('emits a heading that extractCandidatesViaRegex actually matches', () => {
+    const prose = [
+      'Scored the open read: long trigger never fired.',
+      '',
+      instructedHeading(),
+      '',
+      '- A +γ cluster that survives two slices holds as an intraday floor.',
+      '- Charm sign flips before spot does on drift-and-cap days.',
+    ].join('\n');
+
+    expect(extractCandidatesViaRegex(prose)).toEqual([
+      'A +γ cluster that survives two slices holds as an intraday floor.',
+      'Charm sign flips before spot does on drift-and-cap days.',
+    ]);
+  });
+
+  it('does not instruct the lessons heading in pre_trade or intraday', () => {
+    for (const mode of ['pre_trade', 'intraday'] as const) {
+      expect(extractCandidatesViaRegex(modeBody(mode))).toEqual([]);
+    }
+  });
+
+  it('keeps the lessons instruction when a parent read is inlined', () => {
+    const blocks = buildUserContent({
+      mode: 'debrief',
+      parentId: 7,
+      parentRead: {
+        id: 7,
+        mode: 'pre_trade',
+        tradingDate: '2026-08-21',
+        proseText: 'Pin day.',
+        structured: fields({ spot: 7250 }),
+      },
+      images: [],
+    });
+    const body = (blocks[0] as { type: 'text'; text: string }).text;
+    expect(body).toContain('What to add to the model');
+    expect(body).toContain('Open read to score (id 7, 2026-08-21)');
+  });
+
+  it('scores against DB-recorded outcome, not a candle chart', () => {
+    const body = modeBody('debrief');
+    expect(body).toContain('YOU ARE IN DEBRIEF MODE');
+    expect(body).toContain('recorded in the database');
+    // "candle chart" survives only inside the prohibition line.
+    const candleLines = body.split('\n').filter((l) => l.includes('candle'));
+    expect(candleLines).toEqual([
+      expect.stringContaining('no candle chart') as unknown as string,
+    ]);
+  });
+});
+
+/**
+ * The lessons instruction is only worth anything if the model can
+ * actually satisfy it. Because the call passes `tools:
+ * [STRUCTURED_TOOL]` and a `tool_use` block terminates the assistant
+ * turn (`stop_reason: 'tool_use'`), and because `runCachedAnthropicCall`
+ * is single-shot (it concatenates the text blocks of ONE
+ * `finalMessage()` — there is no continuation loop), any instruction to
+ * write the lessons section AFTER the structured output emits nothing at
+ * all. `prose_text` never carries the heading, the extractor above finds
+ * no candidates, and `curate-periscope-lessons` stays a no-op.
+ *
+ * These tests pin the ordering so that regression cannot return quietly.
+ */
+describe('buildDebriefModeBody — lessons section precedes the tool call', () => {
+  it('tells the model to write the section BEFORE calling the structured tool', () => {
+    const body = modeBody('debrief');
+    expect(body).toContain(STRUCTURED_TOOL_NAME);
+    expect(body).toContain(
+      `write it BEFORE you call the \`${STRUCTURED_TOOL_NAME}\` tool`,
+    );
+  });
+
+  it('explains WHY: the tool call ends the turn, so later prose is never generated', () => {
+    const body = modeBody('debrief');
+    expect(body).toContain('ENDS YOUR TURN');
+    expect(body).toMatch(/never generated|silently lost/i);
+  });
+
+  it('states an explicit response order with the lessons section ahead of the tool call', () => {
+    const orderLine = modeBody('debrief')
+      .split('\n')
+      .find((l) => l.startsWith('Required response order:'));
+    expect(orderLine).toBeDefined();
+    const lessonsIdx = orderLine!.indexOf('(2) the lessons section');
+    const toolIdx = orderLine!.indexOf('(3) the tool call');
+    expect(lessonsIdx).toBeGreaterThan(-1);
+    expect(toolIdx).toBeGreaterThan(lessonsIdx);
+  });
+
+  it('never instructs the section after the structured output (the unsatisfiable ordering)', () => {
+    const body = modeBody('debrief');
+    expect(body).not.toMatch(/after the (required )?structured output/i);
+    expect(body).not.toMatch(
+      /after (the )?(required )?(tool call|JSON block)/i,
+    );
+  });
+
+  it('states the ordering rule before it states the heading, so the rule is read first', () => {
+    const body = modeBody('debrief');
+    const ruleIdx = body.indexOf(STRUCTURED_TOOL_NAME);
+    const headingIdx = body.indexOf('\n## What to add to the model');
+    expect(ruleIdx).toBeGreaterThan(-1);
+    expect(headingIdx).toBeGreaterThan(ruleIdx);
+  });
+
+  it('survives a parent read being inlined — ordering rule and heading both stay', () => {
+    const blocks = buildUserContent({
+      mode: 'debrief',
+      parentId: 7,
+      parentRead: {
+        id: 7,
+        mode: 'pre_trade',
+        tradingDate: '2026-08-21',
+        proseText: 'Pin day.',
+        structured: fields({ spot: 7250 }),
+      },
+      images: [],
+    });
+    const body = (blocks[0] as { type: 'text'; text: string }).text;
+    expect(body).toContain(
+      `write it BEFORE you call the \`${STRUCTURED_TOOL_NAME}\` tool`,
+    );
+    expect(body).toContain('## What to add to the model');
+  });
+
+  it('does not leak the LESSONS rule into pre_trade or intraday', () => {
+    // Asserts on the lessons instruction specifically, not on the tool
+    // name. Every mode now names the tool: pre_trade and intraday were
+    // carrying stale "the required JSON block at the very end" wording
+    // from the retired fenced-JSON channel, which is the same
+    // ends-your-turn hazard the debrief ordering rule fixes, so they
+    // were migrated to the tool-call phrasing too. Asserting the tool
+    // name is absent would forbid that correct instruction.
+    for (const mode of ['pre_trade', 'intraday'] as const) {
+      const body = modeBody(mode);
+      expect(body).not.toContain('LESSONS SECTION');
+      expect(body).not.toContain('What to add to the model');
+      expect(body).not.toMatch(/lessons section/i);
+    }
+  });
+
+  it('pre_trade and intraday no longer reference the retired JSON block', () => {
+    for (const mode of ['pre_trade', 'intraday'] as const) {
+      const body = modeBody(mode);
+      expect(body).not.toMatch(/JSON block/i);
+      // ...and do state the ends-your-turn ordering for the tool call.
+      expect(body).toContain(STRUCTURED_TOOL_NAME);
+    }
   });
 });

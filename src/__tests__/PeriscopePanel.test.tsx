@@ -8,6 +8,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import type { PeriscopeView } from '../hooks/usePeriscopeExposure';
+import type {
+  PlaybookPanelPayload,
+  PlaybookRow,
+  UsePeriscopePlaybookReturn,
+} from '../hooks/usePeriscopePlaybook';
 import { PeriscopePanel } from '../components/Periscope/PeriscopePanel';
 
 // ── Fixture factory ───────────────────────────────────────────────────
@@ -287,5 +292,250 @@ describe('PeriscopePanel: spot header', () => {
     render(<PeriscopePanel {...baseProps} view={makeView()} />);
     // Default view spot is 5800.25.
     expect(screen.getByText(/spot 5800\.25/)).toBeInTheDocument();
+  });
+});
+
+// ============================================================
+// CLAUDE PLAYBOOK (revived 2026-08-21)
+// ============================================================
+
+function makePanelPayload(
+  overrides: Partial<PlaybookPanelPayload> = {},
+): PlaybookPanelPayload {
+  return {
+    spot: 5800,
+    cone: { lower: 5780, upper: 5820 },
+    longTrigger: 5810,
+    shortTrigger: 5790,
+    regime: 'drift-and-cap',
+    bias: 'two-sided',
+    recommended: ['debit_call_spread'],
+    avoid: ['iron_condor'],
+    futuresPlan: 'LONG: SAFE above 5810',
+    gammaFloor: 5780,
+    gammaCeiling: 5820,
+    magnet: 5800,
+    charmZero: 5805,
+    expectedDealerBehavior: 'sell rallies into 5820',
+    confidence: 'medium',
+    confidenceBasis: 'clean +gamma shelf',
+    narrative: 'two-sided regime',
+    source: 'uw_spot',
+    ...overrides,
+  };
+}
+
+function makePlaybookRow(
+  payload: PlaybookPanelPayload | null,
+  overrides: Partial<PlaybookRow> = {},
+): PlaybookRow {
+  return {
+    id: 1,
+    mode: 'intraday',
+    status: 'complete',
+    // Same instant as the fixture view's capturedAt so the staleness
+    // chip is deterministic relative to the rendered slot.
+    slotCapturedAt: '2026-05-08T13:30:00Z',
+    readTime: '2026-05-08T13:30:00Z',
+    spot: 5800,
+    panelPayload: payload,
+    parentId: null,
+    model: 'claude-opus-5',
+    failureReason: null,
+    durationMs: 1234,
+    createdAt: '2026-05-08T13:30:30Z',
+    ...overrides,
+  };
+}
+
+function makePlaybook(
+  overrides: Partial<UsePeriscopePlaybookReturn> = {},
+): UsePeriscopePlaybookReturn {
+  return {
+    data: makePlaybookRow(makePanelPayload()),
+    latestInProgress: false,
+    asOf: '2026-05-08T13:31:00Z',
+    emptyReason: null,
+    loading: false,
+    error: null,
+    refresh: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe('PeriscopePanel: Claude playbook section', () => {
+  it('omits the playbook entirely when no playbook prop is passed', () => {
+    render(<PeriscopePanel {...baseProps} view={makeView()} />);
+    expect(screen.queryByTestId('playbook-section')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('playbook-empty')).not.toBeInTheDocument();
+  });
+
+  it('renders the playbook body above the deterministic map', () => {
+    render(
+      <PeriscopePanel
+        {...baseProps}
+        view={makeView()}
+        playbook={makePlaybook()}
+      />,
+    );
+    expect(screen.getByTestId('playbook-section')).toBeInTheDocument();
+    expect(screen.getByText(/Claude Playbook/i)).toBeInTheDocument();
+    expect(screen.getByText('INTRADAY')).toBeInTheDocument();
+    expect(screen.getByText('LONG TRIGGER')).toBeInTheDocument();
+    // Deterministic map is NOT hidden by the playbook — it is the
+    // comparison surface.
+    expect(screen.getByText(/MM Exposure Map/i)).toBeInTheDocument();
+  });
+
+  it('renders the in-progress hint when a newer slot is mid-flight', () => {
+    render(
+      <PeriscopePanel
+        {...baseProps}
+        view={makeView()}
+        playbook={makePlaybook({ latestInProgress: true })}
+      />,
+    );
+    expect(
+      screen.getByLabelText(/newer slot claude is reading/i),
+    ).toBeInTheDocument();
+  });
+
+  it('renders a staleness chip for the slot age', () => {
+    render(
+      <PeriscopePanel
+        {...baseProps}
+        view={makeView()}
+        playbook={makePlaybook()}
+      />,
+    );
+    // Fixture slot is well in the past relative to any real run clock,
+    // so the chip degrades to the prior-session badge.
+    expect(screen.getByLabelText(/prior trading session/i)).toBeInTheDocument();
+  });
+
+  it('renders the empty state when no completed row exists yet', () => {
+    render(
+      <PeriscopePanel
+        {...baseProps}
+        view={makeView()}
+        playbook={makePlaybook({ data: null, emptyReason: 'no_playbook' })}
+      />,
+    );
+    expect(screen.getByTestId('playbook-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('playbook-section')).not.toBeInTheDocument();
+  });
+
+  it('renders the empty state when the row exists but panelPayload failed validation', () => {
+    render(
+      <PeriscopePanel
+        {...baseProps}
+        view={makeView()}
+        playbook={makePlaybook({ data: makePlaybookRow(null) })}
+      />,
+    );
+    expect(screen.getByTestId('playbook-empty')).toBeInTheDocument();
+  });
+
+  it('hides the playbook entirely on hook error, leaving the deterministic map', () => {
+    render(
+      <PeriscopePanel
+        {...baseProps}
+        view={makeView()}
+        playbook={makePlaybook({ error: 'HTTP 503' })}
+      />,
+    );
+    expect(screen.queryByTestId('playbook-section')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('playbook-empty')).not.toBeInTheDocument();
+    expect(screen.getByText(/MM Exposure Map/i)).toBeInTheDocument();
+  });
+});
+
+// ============================================================
+// DATA-SOURCE WARNING
+// ============================================================
+//
+// `panel_payload.source` records which periscope_snapshots series the
+// read was built from. Only `uw_spot` is the live raw-dollar intraday
+// series; `uw_eod` is a once-daily 15:00-CT normalized slice ~1000x
+// smaller in magnitude. A well-formed read on the wrong scale is
+// indistinguishable from a good one at a glance, so anything that is
+// not provably `uw_spot` must shout.
+
+describe('PeriscopePanel: playbook data-source warning', () => {
+  function renderWithSource(source: string | undefined) {
+    const payload = makePanelPayload();
+    if (source === undefined) delete payload.source;
+    else payload.source = source;
+    return render(
+      <PeriscopePanel
+        {...baseProps}
+        view={makeView()}
+        playbook={makePlaybook({ data: makePlaybookRow(payload) })}
+      />,
+    );
+  }
+
+  it('renders NO warning on a live uw_spot read, and confirms it with a live chip', () => {
+    renderWithSource('uw_spot');
+    expect(
+      screen.queryByTestId('playbook-source-warning'),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId('playbook-source-live')).toBeInTheDocument();
+  });
+
+  it('renders a visible alert on a uw_eod read explaining the scale mismatch', () => {
+    renderWithSource('uw_eod');
+    const warning = screen.getByTestId('playbook-source-warning');
+    expect(warning).toBeInTheDocument();
+    // role=alert so screen readers announce it rather than the trader
+    // having to hunt for a tooltip.
+    expect(warning).toHaveAttribute('role', 'alert');
+    expect(warning).toHaveTextContent(/not a live read/i);
+    expect(warning).toHaveTextContent(/end-of-day/i);
+    expect(warning).toHaveTextContent(/1000x smaller/i);
+    expect(screen.getByTestId('playbook-source-stamp')).toHaveTextContent(
+      /uw_eod/,
+    );
+    // The live-confirmation chip must be gone.
+    expect(
+      screen.queryByTestId('playbook-source-live'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('renders a visible alert on a retired gexbot read', () => {
+    renderWithSource('gexbot');
+    const warning = screen.getByTestId('playbook-source-warning');
+    expect(warning).toHaveTextContent(/not a live read/i);
+    expect(warning).toHaveTextContent(/gexbot/i);
+  });
+
+  it('warns as NOT VERIFIED (not "live") when source is absent on an older row', () => {
+    renderWithSource(undefined);
+    const warning = screen.getByTestId('playbook-source-warning');
+    expect(warning).toHaveTextContent(/data source not verified/i);
+    expect(screen.getByTestId('playbook-source-stamp')).toHaveTextContent(
+      /missing/i,
+    );
+    expect(
+      screen.queryByTestId('playbook-source-live'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('still renders the rest of the playbook body alongside the warning', () => {
+    renderWithSource('uw_eod');
+    // Degrade loudly, not silently — the numbers stay visible so the
+    // user can compare them against the deterministic map, but they
+    // are unmistakably flagged.
+    expect(screen.getByTestId('playbook-section')).toBeInTheDocument();
+    expect(screen.getByText('LONG TRIGGER')).toBeInTheDocument();
+  });
+
+  it('warns on an unrecognized source vocabulary rather than assuming it is live', () => {
+    renderWithSource('some_future_feed');
+    const warning = screen.getByTestId('playbook-source-warning');
+    expect(warning).toHaveTextContent(/data source not verified/i);
+    expect(screen.getByTestId('playbook-source-stamp')).toHaveTextContent(
+      /some_future_feed/,
+    );
   });
 });

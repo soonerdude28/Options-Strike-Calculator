@@ -9,6 +9,11 @@
  * stepper that swaps the data source to `/api/periscope-exposure` for
  * historical replay (full ~6-month back-catalog from periscope_snapshots).
  *
+ * When a Claude auto-playbook row exists for the displayed slot, its
+ * prose read renders above the deterministic map via `PlaybookSection`
+ * (revived 2026-08-21). The deterministic map always stays visible
+ * beneath it as the comparison surface.
+ *
  * Empty states are explicit: "no SPX spot yet" or "no GEXBot capture
  * for today yet" — never a blank panel.
  */
@@ -22,7 +27,9 @@ import type {
   PeriscopeView,
   PeriscopeSelectedSlot,
 } from '../../hooks/usePeriscopeExposure';
+import type { UsePeriscopePlaybookReturn } from '../../hooks/usePeriscopePlaybook';
 import { MMExposureMap } from './MMExposureMap';
+import { PlaybookSection } from './PlaybookSection';
 import { SlotPicker } from './SlotPicker';
 
 interface PeriscopePanelProps {
@@ -38,6 +45,12 @@ interface PeriscopePanelProps {
   selectedSlot: PeriscopeSelectedSlot | null;
   /** Callback to change the selected slot. Pass null to drop back to live. */
   onSelectSlot: (slot: PeriscopeSelectedSlot | null) => void;
+  /**
+   * Optional Claude-generated playbook. Rendered as the top section
+   * when supplied. The deterministic `MMExposureMap` stays beneath it
+   * so the panel is never empty and the two reads can be compared.
+   */
+  playbook?: UsePeriscopePlaybookReturn | undefined;
 }
 
 /** Convert an ISO captured_at to a CT HH:MM string (zero-padded).
@@ -69,6 +82,7 @@ function PeriscopePanelInner({
   availableSlots,
   selectedSlot,
   onSelectSlot,
+  playbook,
 }: PeriscopePanelProps) {
   // Resolve the displayed slot's CT timestamps. When the rendered view
   // exists, prefer its captured_at (ground truth). Otherwise fall back
@@ -116,7 +130,7 @@ function PeriscopePanelInner({
       </p>
     );
   } else {
-    body = <PeriscopeBody view={view} />;
+    body = <PeriscopeBody view={view} playbook={playbook} />;
   }
 
   return (
@@ -146,7 +160,13 @@ function PeriscopePanelInner({
   );
 }
 
-function PeriscopeBody({ view }: { view: PeriscopeView }) {
+function PeriscopeBody({
+  view,
+  playbook,
+}: {
+  view: PeriscopeView;
+  playbook?: UsePeriscopePlaybookReturn | undefined;
+}) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-baseline justify-between font-mono text-[11px]">
@@ -155,6 +175,8 @@ function PeriscopeBody({ view }: { view: PeriscopeView }) {
         </span>
         <span style={{ color: theme.text }}>spot {view.spot.toFixed(2)}</span>
       </div>
+
+      {playbook != null && <PlaybookSection playbook={playbook} />}
 
       <MMExposureMap view={view} />
     </div>

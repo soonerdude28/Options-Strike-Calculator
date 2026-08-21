@@ -57,7 +57,8 @@
 # pattern in .gitignore so `vercel deploy` from the CLI ships only
 # what git would ship: the 4 committed SKILL.md files plus the
 # periscope/references/** tree (loaded via `includeFiles` for the
-# api/periscope-auto-playbook.ts function).
+# api/cron/periscope-playbook.ts function — the auto-playbook was
+# retired in f52db025 and revived as that cron on 2026-08-21).
 #
 # Git-triggered deploys never saw this bloat — Vercel clones the
 # tracked git tree directly. CLI deploys upload the local working

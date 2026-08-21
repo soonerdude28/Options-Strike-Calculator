@@ -15,7 +15,8 @@ import type { NeonQueryFunction } from '@neondatabase/serverless';
 import {
   E1_HOLD_BARS,
   E5_BREAKDOWN_PTS,
-  PCS_MAX_ABS_GEX,
+  PCS_MIN_NODES_FOR_PCTILE,
+  PCS_SMALL_WALL_PCTILE,
   PERISCOPE_MAX_AGE_MIN,
   computeEsBasisChange5m,
   detectE1,
@@ -31,6 +32,7 @@ import {
   loadPositiveGammaNodes,
   loadPreDayFilter,
   loadRecentBars,
+  smallWallCutoff,
   type Bar,
   type DayContext,
   type DetectorFire,
@@ -241,9 +243,118 @@ describe('detectE5 — disabled (forward-looking selection bias)', () => {
   });
 });
 
+// ============================================================
+// SMALL-WALL QUANTILE HELPER
+// ============================================================
+
+describe('smallWallCutoff', () => {
+  it('returns null for an empty sample (no quantile of nothing)', () => {
+    expect(smallWallCutoff([], 0.15)).toBeNull();
+  });
+
+  it('returns null when every value is non-finite', () => {
+    expect(
+      smallWallCutoff(
+        [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY],
+        0.5,
+      ),
+    ).toBeNull();
+  });
+
+  it('returns the sole value for a single-element sample, any pctile', () => {
+    expect(smallWallCutoff([42], 0)).toBe(42);
+    expect(smallWallCutoff([42], 0.15)).toBe(42);
+    expect(smallWallCutoff([42], 1)).toBe(42);
+  });
+
+  it('lands exactly on an order statistic when the index is integral', () => {
+    // n=5 → idx = p * 4. p=0.5 → idx 2 → sorted[2].
+    expect(smallWallCutoff([0, 10, 20, 30, 40], 0.5)).toBe(20);
+    expect(smallWallCutoff([0, 10, 20, 30, 40], 0.25)).toBe(10);
+  });
+
+  it('interpolates linearly between bracketing order statistics', () => {
+    // n=5 → idx = 0.15 * 4 = 0.6 → sorted[0] + (sorted[1]-sorted[0])*0.6
+    expect(smallWallCutoff([0, 10, 20, 30, 40], 0.15)).toBeCloseTo(6, 10);
+    // n=4 → idx = 0.5 * 3 = 1.5 → midpoint of 2 and 3. This is the case
+    // that distinguishes percentile_cont (2.5) from a discrete
+    // percentile_disc (3) — pinning it keeps us aligned with the SQL
+    // PERCENTILE_CONT used elsewhere in the codebase.
+    expect(smallWallCutoff([1, 2, 3, 4], 0.5)).toBeCloseTo(2.5, 10);
+  });
+
+  it('returns min at p=0 and max at p=1', () => {
+    expect(smallWallCutoff([5, 1, 9, 3], 0)).toBe(1);
+    expect(smallWallCutoff([5, 1, 9, 3], 1)).toBe(9);
+  });
+
+  it('clamps out-of-range pctiles instead of indexing out of bounds', () => {
+    expect(smallWallCutoff([5, 1, 9, 3], -1)).toBe(1);
+    expect(smallWallCutoff([5, 1, 9, 3], 2)).toBe(9);
+  });
+
+  it('sorts numerically, not lexicographically', () => {
+    // Default Array.sort() would order these as 100, 1000, 9 and return
+    // 1000 as the median. Numeric sort gives 9, 100, 1000 → 100.
+    expect(smallWallCutoff([1000, 9, 100], 0.5)).toBe(100);
+  });
+
+  it('accepts unsorted input without mutating the caller array', () => {
+    const input = [30, 0, 20, 40, 10];
+    expect(smallWallCutoff(input, 0.5)).toBe(20);
+    expect(input).toEqual([30, 0, 20, 40, 10]);
+  });
+
+  it('drops non-finite values rather than poisoning the sort', () => {
+    expect(
+      smallWallCutoff(
+        [Number.NaN, 0, 10, 20, 30, 40, Number.POSITIVE_INFINITY],
+        0.5,
+      ),
+    ).toBe(20);
+  });
+
+  it('is scale-equivariant: cutoff(k*x) === k*cutoff(x)', () => {
+    const xs = [3, 1, 4, 1, 5, 9, 2, 6];
+    const base = smallWallCutoff(xs, PCS_SMALL_WALL_PCTILE) as number;
+    for (const k of [1e-3, 2, 1e3, 1e6]) {
+      expect(
+        smallWallCutoff(
+          xs.map((x) => x * k),
+          PCS_SMALL_WALL_PCTILE,
+        ),
+      ).toBeCloseTo(base * k, 6);
+    }
+  });
+});
+
 describe('detectPcsMonday', () => {
-  const node: GammaNode = { strike: 7400, value: 100_000 }; // small wall
-  const bigNode: GammaNode = { strike: 7400, value: 2_000_000 }; // big wall
+  // Filler nodes sit at strikes 7300–7380, far below the wick window
+  // (7398, 7402), so they can never satisfy the wick geometry — they
+  // exist only to give the slice a realistic value distribution for the
+  // within-slice quantile. Sorted filler values:
+  //   1e6, 2e6, 5e6, 1e7, 2e7, 5e7, 1e8, 2e8, 5e8
+  const FILLER_VALUES = [1e6, 2e6, 5e6, 1e7, 2e7, 5e7, 1e8, 2e8, 5e8];
+
+  /**
+   * Build a 10-node slice: the node under test at strike 7400 plus the
+   * nine fillers, every value multiplied by `scale` (used by the
+   * scale-invariance test).
+   */
+  const makeSlice = (targetValue: number, scale = 1): GammaNode[] => [
+    { strike: 7400, value: targetValue * scale },
+    ...FILLER_VALUES.map((v, i) => ({
+      strike: 7300 + i * 10,
+      value: v * scale,
+    })),
+  ];
+
+  // With the 10-node slice below, idx = 0.15 * 9 = 1.35, so the cutoff
+  // interpolates 35% of the way from sorted[1] to sorted[2].
+  //   SMALL: sorted = [2e5, 1e6, 2e6, ...] → cutoff = 1.35e6, 2e5 passes.
+  //   BIG:   sorted = [1e6, 2e6, 3e6, ...] → cutoff = 2.35e6, 3e6 fails.
+  const SMALL_WALL = 200_000;
+  const BIG_WALL = 3_000_000;
 
   const wickBar = makeBar({
     open: 7405,
@@ -254,35 +365,185 @@ describe('detectPcsMonday', () => {
 
   it('fires on Monday with small wall + ES basis + non-flat gap', () => {
     const ctx = makeDayContext({ dow_label: 'Monday', open_gap_pct: 0.5 });
-    const hit = detectPcsMonday([wickBar], [node], ctx, 1.0); // ES basis ok
+    const hit = detectPcsMonday([wickBar], makeSlice(SMALL_WALL), ctx, 1.0);
     expect(hit).not.toBeNull();
     expect(hit?.node.strike).toBe(7400);
+    expect(hit?.node.value).toBe(SMALL_WALL);
   });
 
   it('does not fire on Tuesday', () => {
     const ctx = makeDayContext({ dow_label: 'Tuesday' });
-    expect(detectPcsMonday([wickBar], [node], ctx, 1.0)).toBeNull();
+    expect(
+      detectPcsMonday([wickBar], makeSlice(SMALL_WALL), ctx, 1.0),
+    ).toBeNull();
   });
 
   it('does not fire on flat-gap day', () => {
     const ctx = makeDayContext({ open_gap_pct: 0.05 });
-    expect(detectPcsMonday([wickBar], [node], ctx, 1.0)).toBeNull();
-  });
-
-  it('does not fire when wall is too large', () => {
-    const ctx = makeDayContext();
-    expect(Math.abs(bigNode.value)).toBeGreaterThan(PCS_MAX_ABS_GEX);
-    expect(detectPcsMonday([wickBar], [bigNode], ctx, 1.0)).toBeNull();
+    expect(
+      detectPcsMonday([wickBar], makeSlice(SMALL_WALL), ctx, 1.0),
+    ).toBeNull();
   });
 
   it('does not fire when ES basis is weak', () => {
     const ctx = makeDayContext();
-    expect(detectPcsMonday([wickBar], [node], ctx, -0.1)).toBeNull();
+    expect(
+      detectPcsMonday([wickBar], makeSlice(SMALL_WALL), ctx, -0.1),
+    ).toBeNull();
   });
 
   it('fires when ES basis is null (passthrough — basis filter skipped)', () => {
     const ctx = makeDayContext();
-    expect(detectPcsMonday([wickBar], [node], ctx, null)).not.toBeNull();
+    expect(
+      detectPcsMonday([wickBar], makeSlice(SMALL_WALL), ctx, null),
+    ).not.toBeNull();
+  });
+
+  it('does not fire on a bar whose range is below MIN_WICK_RANGE_PTS', () => {
+    const ctx = makeDayContext();
+    const tightBar = makeBar({
+      open: 7401,
+      high: 7401.5,
+      low: 7399.5,
+      close: 7400.5, // pierces 7400 but range is only 2pt
+    });
+    expect(
+      detectPcsMonday([tightBar], makeSlice(SMALL_WALL), ctx, 1.0),
+    ).toBeNull();
+  });
+
+  it('does not fire on empty bars or an empty node slice', () => {
+    const ctx = makeDayContext();
+    expect(detectPcsMonday([], makeSlice(SMALL_WALL), ctx, 1.0)).toBeNull();
+    expect(detectPcsMonday([wickBar], [], ctx, 1.0)).toBeNull();
+  });
+
+  // --- within-slice quantile gate -------------------------------------
+
+  it('rejects a node ABOVE the slice p15 and fires on one BELOW it', () => {
+    const ctx = makeDayContext();
+    const small = makeSlice(SMALL_WALL);
+    const big = makeSlice(BIG_WALL);
+
+    // Sanity-check the fixture against the helper so the test documents
+    // WHY these two values straddle the gate rather than asserting on
+    // magic numbers.
+    const smallCutoff = smallWallCutoff(
+      small.map((n) => n.value),
+      PCS_SMALL_WALL_PCTILE,
+    ) as number;
+    const bigCutoff = smallWallCutoff(
+      big.map((n) => n.value),
+      PCS_SMALL_WALL_PCTILE,
+    ) as number;
+    expect(SMALL_WALL).toBeLessThanOrEqual(smallCutoff);
+    expect(BIG_WALL).toBeGreaterThan(bigCutoff);
+
+    expect(detectPcsMonday([wickBar], small, ctx, 1.0)).not.toBeNull();
+    expect(detectPcsMonday([wickBar], big, ctx, 1.0)).toBeNull();
+  });
+
+  it('fires on a node sitting exactly ON the cutoff (inclusive <=)', () => {
+    const ctx = makeDayContext();
+    // Uniform slice → every quantile equals the common value, so the
+    // target is exactly at the cutoff. Inclusive comparison must fire.
+    const uniform: GammaNode[] = [
+      { strike: 7400, value: 1e6 },
+      { strike: 7300, value: 1e6 },
+      { strike: 7310, value: 1e6 },
+      { strike: 7320, value: 1e6 },
+      { strike: 7330, value: 1e6 },
+    ];
+    expect(detectPcsMonday([wickBar], uniform, ctx, 1.0)).not.toBeNull();
+  });
+
+  // --- degenerate-sample guard ----------------------------------------
+
+  it('exports PCS_MIN_NODES_FOR_PCTILE and PCS_SMALL_WALL_PCTILE', () => {
+    expect(PCS_MIN_NODES_FOR_PCTILE).toBe(5);
+    expect(PCS_SMALL_WALL_PCTILE).toBe(0.15);
+  });
+
+  it('does not fire below PCS_MIN_NODES_FOR_PCTILE, even on a tiny wall', () => {
+    const ctx = makeDayContext();
+    // Same geometry that fires with a full slice — only the sample size
+    // differs. A p15 over <5 points is an interpolation between two
+    // arbitrary observations, so we decline rather than guess.
+    for (let n = 1; n < PCS_MIN_NODES_FOR_PCTILE; n += 1) {
+      const slice = makeSlice(SMALL_WALL).slice(0, n);
+      expect(slice).toHaveLength(n);
+      expect(detectPcsMonday([wickBar], slice, ctx, 1.0)).toBeNull();
+    }
+  });
+
+  it('fires at exactly PCS_MIN_NODES_FOR_PCTILE nodes (boundary is >=)', () => {
+    const ctx = makeDayContext();
+    const slice = makeSlice(SMALL_WALL).slice(0, PCS_MIN_NODES_FOR_PCTILE);
+    expect(slice).toHaveLength(5);
+    expect(detectPcsMonday([wickBar], slice, ctx, 1.0)).not.toBeNull();
+  });
+
+  // --- SCALE INVARIANCE (regression guard for the whole bug class) -----
+
+  it('is SCALE-INVARIANT: multiplying every node value by 1000 (or any positive constant) changes no decision', () => {
+    const ctx = makeDayContext();
+
+    // This is the regression guard for the GEXBot→UW class of bug: an
+    // absolute dollar cutoff silently changed meaning when the feed's
+    // units changed. A within-slice quantile cannot, because the cutoff
+    // scales with the data. If someone reintroduces an absolute
+    // threshold anywhere in this gate, this test fails.
+    for (const scale of [1e-6, 1e-3, 0.5, 1, 2, 1e3, 1e6, 1e9]) {
+      const smallHit = detectPcsMonday(
+        [wickBar],
+        makeSlice(SMALL_WALL, scale),
+        ctx,
+        1.0,
+      );
+      const bigHit = detectPcsMonday(
+        [wickBar],
+        makeSlice(BIG_WALL, scale),
+        ctx,
+        1.0,
+      );
+      // Small wall fires at every scale; big wall never does.
+      expect(smallHit, `small wall @ scale ${scale}`).not.toBeNull();
+      expect(smallHit?.node.strike).toBe(7400);
+      expect(smallHit?.node.value).toBeCloseTo(SMALL_WALL * scale, 6);
+      expect(bigHit, `big wall @ scale ${scale}`).toBeNull();
+    }
+  });
+
+  it('is scale-invariant even at the 1000x gap that broke the old constant', () => {
+    // The repoint moved gamma between two feeds ~1000x apart in units
+    // (normalized greek-exposure vs raw-dollar spot-exposures). Assert
+    // the exact 1000x pair explicitly, not just as one loop iteration.
+    const ctx = makeDayContext();
+    const at1x = detectPcsMonday([wickBar], makeSlice(SMALL_WALL, 1), ctx, 1.0);
+    const at1000x = detectPcsMonday(
+      [wickBar],
+      makeSlice(SMALL_WALL, 1000),
+      ctx,
+      1.0,
+    );
+    expect(at1x).not.toBeNull();
+    expect(at1000x).not.toBeNull();
+    expect(at1000x?.node.strike).toBe(at1x?.node.strike);
+
+    const bigAt1x = detectPcsMonday(
+      [wickBar],
+      makeSlice(BIG_WALL, 1),
+      ctx,
+      1.0,
+    );
+    const bigAt1000x = detectPcsMonday(
+      [wickBar],
+      makeSlice(BIG_WALL, 1000),
+      ctx,
+      1.0,
+    );
+    expect(bigAt1x).toBeNull();
+    expect(bigAt1000x).toBeNull();
   });
 });
 
@@ -384,11 +645,13 @@ describe('loadPositiveGammaNodes', () => {
   });
 
   it('pins the outer read AND the MAX(captured_at) subquery to uw_spot', async () => {
-    // Migration #191: the node value is compared against an absolute
-    // dollar threshold (PCS_MAX_ABS_GEX) and diffed slice-over-slice,
-    // so the normalized uw_eod backfill must never satisfy this read —
+    // Migration #191: node values are diffed slice-over-slice and the
+    // small-wall gate is a WITHIN-SLICE quantile, so mixing sources
+    // would blend two unit systems into one distribution. The
+    // normalized uw_eod backfill must never satisfy this read —
     // including inside the subquery, where a 15:00 CT backfill row
-    // would otherwise win MAX(captured_at).
+    // would otherwise win MAX(captured_at) and hand the detector a
+    // stale one-slice-per-day board.
     const { sql, mock } = makeMockSql([[]]);
     await loadPositiveGammaNodes(sql, '2026-05-21');
     const [strings, ...params] = mock.mock.calls[0] as [string[], ...unknown[]];

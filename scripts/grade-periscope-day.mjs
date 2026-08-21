@@ -9,16 +9,25 @@
  *
  * # Usage
  *
- *   source .env.local
- *   node scripts/grade-periscope-day.mjs --date 2026-05-08
+ * MUST be run under `tsx`, not bare `node`. This script pulls in
+ * `api/_lib/periscope-grader.ts`, which imports its siblings with
+ * explicit `.js` specifiers — mandatory for Vercel Functions, whose
+ * Node ESM resolver is strict (see CLAUDE.md, "Explicit .js extensions").
+ * Node's own type-stripping does NOT map `.js` -> `.ts`, so plain
+ * `node` dies with ERR_MODULE_NOT_FOUND on the first transitive import.
+ * `tsx` resolves the mapping, so the `.js` specifiers stay correct for
+ * both targets. Do not "fix" this by rewriting those imports to `.ts` —
+ * that would break the deployed Function.
+ *
+ *   npx tsx --env-file=.env.local scripts/grade-periscope-day.mjs --date 2026-05-08
  *
  *   # Range (one day at a time, sequentially):
  *   for d in 2026-05-06 2026-05-07 2026-05-08; do
- *     node scripts/grade-periscope-day.mjs --date $d
+ *     npx tsx --env-file=.env.local scripts/grade-periscope-day.mjs --date $d
  *   done
  *
  *   # Dry run — counts slots and shows what would be graded
- *   node scripts/grade-periscope-day.mjs --date 2026-05-08 --dry-run
+ *   npx tsx --env-file=.env.local scripts/grade-periscope-day.mjs --date 2026-05-08 --dry-run
  *
  * # What it does
  *

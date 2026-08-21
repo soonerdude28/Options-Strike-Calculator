@@ -12,9 +12,11 @@
  *  - E5 long-put failed-reversal: a recent (≤10 min) down-wick rejected
  *    a +γ floor, but price never recovered, and now broke 1pt below the
  *    wick low.
- *  - PCS Monday rejection: down-wick at a SMALL (|gex|≤$500k) +γ floor,
- *    bar.open > node, bar.low < node, bar.close > node. Monday + ES basis
- *    holding + not flat-gap day.
+ *  - PCS Monday rejection: down-wick at a SMALL +γ floor (bottom
+ *    PCS_SMALL_WALL_PCTILE of the CURRENT slice's own +γ node values —
+ *    self-calibrating, not an absolute dollar figure), bar.open > node,
+ *    bar.low < node, bar.close > node. Monday + ES basis holding + not
+ *    flat-gap day.
  *
  * Detection is INTENTIONALLY CONSERVATIVE for Phase 1 — better to miss
  * a setup than to fire a false positive on a brand-new alert system.
@@ -35,8 +37,66 @@ type Sql = NeonQueryFunction<false, false>;
 // CONSTANTS — kept here for easy tuning
 // ============================================================
 
-/** Maximum |gex| for the PCS Monday "small wall" filter. */
-export const PCS_MAX_ABS_GEX = 500_000;
+/**
+ * PCS Monday "small wall" selectivity, expressed as a QUANTILE of the
+ * current slice's own positive-γ node values rather than an absolute
+ * dollar figure.
+ *
+ * SEMANTIC: the PCS setup wants a down-wick that gets rejected at a
+ * SMALL +γ floor. A big +γ wall is a different regime (dealers pin hard
+ * and the wick is not a rejection signal); the setup is specifically the
+ * thin floor that price pokes through and recovers from. "Small" is
+ * therefore inherently RELATIVE to the rest of the board on that slice —
+ * which is exactly what a quantile expresses and an absolute dollar
+ * cutoff does not.
+ *
+ * WHY 0.15 — SELECTIVITY-PRESERVING PORT, *NOT* A CALIBRATION:
+ * This replaced `PCS_MAX_ABS_GEX = 500_000`, an absolute cutoff carried
+ * over from the GEXBot era. When Periscope ingestion was repointed onto
+ * Unusual Whales (`source='uw_spot'`, raw dollar exposure from
+ * `gex_strike_0dte` — see periscope-uw-repoint-2026-08-21.md), the units
+ * underneath that constant changed, so its meaning changed silently.
+ *
+ * The GEXBot-era intent is UNRECOVERABLE: the constant's origin is
+ * undocumented (nothing in the spec), `GEXBOT_API_KEY` now returns HTTP
+ * 401 (trial expired), and `periscope_snapshots` held ZERO gexbot rows —
+ * so there is no historical sample to re-derive an equivalent cutoff
+ * from. The only thing that CAN be preserved is the SELECTIVITY the old
+ * constant happened to have on data we can actually measure.
+ *
+ * Measured over live `uw_spot` data (56,816 strike-ticks in
+ * `gex_strike_0dte`), the positive-γ node population (n=22,326) is:
+ *
+ *   p05 = 2,874 | p10 = 100,451 | p25 = 3,592,921 | p50 = 26,314,201
+ *
+ * The old 500,000 constant passes 15.5% of positive nodes — i.e. it sits
+ * at roughly the 15th percentile. 0.15 reproduces that pass rate.
+ *
+ * THIS IS NOT AN OUTCOME-VALIDATED NUMBER. Nothing here says 15% is the
+ * selectivity that maximises PCS edge; it says 15% is what we were
+ * unknowingly running, so porting to it changes fire behaviour as little
+ * as possible while making the threshold immune to the next unit change.
+ * Validate it for real once `ws_gamma_setup_fires` has accumulated
+ * forward returns via the `backfill-gamma-setup-outcomes` cron — sweep
+ * the quantile and pick on realised outcome, then update this comment to
+ * say "calibrated" instead of "ported".
+ */
+export const PCS_SMALL_WALL_PCTILE = 0.15;
+
+/**
+ * Minimum positive-γ node count before the PCS_SMALL_WALL_PCTILE cutoff
+ * is trusted. A 15th percentile over 2–3 observations is not a
+ * percentile — it is an interpolation between two arbitrary points, and
+ * at n=1 it degenerates to "the only node always qualifies", which would
+ * make the small-wall gate a no-op precisely on the thinnest, least
+ * representative slices (early session, partial snapshot, ingestion
+ * hiccup). Firing on an unrepresentative slice is strictly worse than
+ * not firing: PCS is a low-frequency Monday-only setup, so a missed fire
+ * costs one opportunity while a mis-gated fire pollutes the outcome
+ * table we intend to calibrate on. Below this count the detector returns
+ * no fire.
+ */
+export const PCS_MIN_NODES_FOR_PCTILE = 5;
 
 /** ES basis change is "top quartile" if >= +0.5 pts in last 5 min.
  *  Phase 1: this is a placeholder threshold — refine after backtest. */
@@ -261,13 +321,14 @@ interface GammaRow {
  * for today's 0DTE expiry. Returns empty array if no snapshot found within
  * PERISCOPE_MAX_AGE_MIN minutes.
  *
- * Pinned to `source = 'uw_spot'` (migration #191): the node's `value`
- * is compared against the absolute PCS_MAX_ABS_GEX dollar threshold and
- * diffed slice-over-slice downstream, so the normalized `uw_eod`
- * backfill (~1000x smaller gamma, one synthetic 15:00 CT slice per day)
- * and the dead `gexbot` series must never satisfy this read — a stale
- * EOD row would otherwise win MAX(captured_at) and pass the small-wall
- * filter on units alone.
+ * Pinned to `source = 'uw_spot'` (migration #191). The small-wall gate
+ * downstream is now a within-slice quantile (PCS_SMALL_WALL_PCTILE), so
+ * it is scale-invariant and no longer breaks on units alone — but the
+ * pin still matters for two other reasons: the values are diffed
+ * slice-over-slice downstream, and the normalized `uw_eod` backfill
+ * (~1000x smaller gamma, one synthetic 15:00 CT slice per day) would
+ * otherwise win MAX(captured_at) and hand the detector a stale, sparse
+ * board. The dead `gexbot` series must likewise never satisfy this read.
  */
 export async function loadPositiveGammaNodes(
   sql: Sql,
@@ -549,6 +610,48 @@ export function findNearestCeilingAbove(
 }
 
 /**
+ * Continuous quantile of `values` at `pctile` (0–1), used to derive the
+ * PCS "small wall" cutoff from the slice being evaluated.
+ *
+ * Uses linear interpolation between the two bracketing order statistics
+ * (type-7 / numpy default), which is exactly Postgres `percentile_cont`
+ * semantics. That match is deliberate: every other percentile in this
+ * codebase is either computed by `PERCENTILE_CONT` in SQL (the lottery
+ * finder's delta pool) or by the same type-7 JS helper
+ * (`analog-range-forecast.ts`, `cron/capture-regime-0dte.ts`), so a
+ * cutoff derived here is directly comparable to those.
+ *
+ * Input need not be sorted — a copy is sorted numerically, so the
+ * caller's node ordering (by strike) is preserved. Non-finite values are
+ * dropped rather than allowed to poison the sort.
+ *
+ * Returns null for an empty (or all-non-finite) input: there is no
+ * quantile of nothing, and null forces the caller to make an explicit
+ * decision instead of silently comparing against NaN (where every `<=`
+ * is false — a silent no-fire that looks like a passing gate).
+ *
+ * NOTE: this helper does NOT enforce a minimum sample size. Whether a
+ * quantile over 3 points is meaningful is a POLICY question owned by the
+ * caller — see PCS_MIN_NODES_FOR_PCTILE in `detectPcsMonday`.
+ */
+export function smallWallCutoff(
+  values: ReadonlyArray<number>,
+  pctile: number,
+): number | null {
+  const sorted = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  if (sorted.length === 1) return sorted[0] as number;
+  const p = Math.min(1, Math.max(0, pctile));
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  const loVal = sorted[lo] as number;
+  if (lo === hi) return loVal;
+  const hiVal = sorted[hi] as number;
+  return loVal + (hiVal - loVal) * (idx - lo);
+}
+
+/**
  * E1 long-call breakthrough detector.
  *
  * Looks for the pattern at bar T - HOLD_BARS - 1 (the breakthrough bar):
@@ -640,12 +743,31 @@ export function detectE5(
 /**
  * PCS Monday rejection detector.
  *
- * Looks for a down-wick at a SMALL +γ floor (|gex| ≤ PCS_MAX_ABS_GEX) on
- * the most recent closed bar. Filter requirements:
+ * Looks for a down-wick at a SMALL +γ floor on the most recent closed
+ * bar. Filter requirements:
  *   - DOW = Monday (caller checks)
  *   - NOT a flat-gap day (|open_gap_pct| >= FLAT_GAP_PCT_THRESHOLD)
  *   - ES basis change >= PCS_ES_BASIS_MIN_CHANGE (ES holding bid) when
  *     basis data is available; pass-through when null
+ *   - node value <= the PCS_SMALL_WALL_PCTILE quantile OF THIS SLICE'S
+ *     OWN node values (see below)
+ *
+ * SELF-CALIBRATING SMALL-WALL GATE: the cutoff is recomputed from the
+ * `nodes` passed on every call rather than compared against a fixed
+ * dollar figure. This makes the gate scale-invariant — multiply every
+ * node value by any positive constant (a units change, a new data
+ * vendor, a normalized vs. raw-dollar feed) and the cutoff scales with
+ * it, so the fire/no-fire decision is unchanged. That property is the
+ * whole point: an absolute cutoff (`PCS_MAX_ABS_GEX = 500_000`) silently
+ * changed meaning when Periscope was repointed from GEXBot to UW, and
+ * this shape makes that class of bug impossible to repeat.
+ *
+ * DEGENERATE INPUTS — deliberate choices:
+ *   - `nodes` empty → no fire. Falls out of the loop naturally, and the
+ *     cutoff helper returns null, which we gate on explicitly.
+ *   - `nodes.length < PCS_MIN_NODES_FOR_PCTILE` → no fire. A quantile
+ *     over a handful of points is not a percentile; see the constant's
+ *     doc comment for why a missed fire beats a mis-gated one here.
  *
  * Returns the detected bar + node if all gates pass.
  */
@@ -668,8 +790,28 @@ export function detectPcsMonday(
   // event-set, which only considered bars with range >= p75 ~ 4pt).
   if (wickBar.high - wickBar.low < MIN_WICK_RANGE_PTS) return null;
 
+  // Small-wall cutoff derived from THIS slice (see doc comment). Guard
+  // the too-few-nodes case before the quantile is consulted at all.
+  if (nodes.length < PCS_MIN_NODES_FOR_PCTILE) return null;
+  const cutoff = smallWallCutoff(
+    nodes.map((n) => n.value),
+    PCS_SMALL_WALL_PCTILE,
+  );
+  // Unreachable given the length guard above (a >= 5-node slice always
+  // has a quantile unless every value is non-finite), but null-checked
+  // rather than non-null-asserted so a future loosening of the guard
+  // can't turn into `value <= NaN` — silently false for every node.
+  if (cutoff == null) return null;
+
   for (const node of nodes) {
-    if (Math.abs(node.value) > PCS_MAX_ABS_GEX) continue;
+    // No Math.abs: `loadPositiveGammaNodes` filters `value > 0` in SQL,
+    // so these are positive-only and the old |gex| wrapper was dead
+    // weight. Worse, it was actively misleading — with a signed input it
+    // would have folded large NEGATIVE (short-gamma ceiling) nodes into
+    // the "small floor" bucket, the opposite of the setup. Dropping it
+    // makes the sign contract explicit: this comparison is only correct
+    // for a positive-only node list.
+    if (node.value > cutoff) continue;
     const isWick =
       wickBar.open > node.strike &&
       wickBar.low < node.strike &&

@@ -171,15 +171,93 @@ enter a delta computation:
 
 ## Open questions / risks
 
-1. **Detector thresholds are calibrated on GEXBot magnitudes.** The v3
-   lottery filter chain and the gamma-setup detector carry absolute-dollar
-   cutoffs tuned against GEXBot's `gamma_zero` scale. UW `spot-exposures`
-   is a different scale, so absolute thresholds are invalidated;
-   rank-based filters (`greek_lvl_rank`, `greek_chg_rank`) survive.
-   **Default pick:** ship ingestion + read paths, and flag the detectors as
-   needing recalibration rather than silently emitting mis-scaled fires.
-   Recalibration is a separate study (cf. `periscope-rules-study-2026-05-21.md`,
-   where zero rules cleared F1 ≥ 0.60).
+1. **~~Detector thresholds are calibrated on GEXBot magnitudes.~~
+   RESOLVED 2026-08-21 — full threshold audit done.** The original worry
+   was that the v3 lottery chain and the gamma-setup detector were shot
+   through with absolute-dollar cutoffs tuned on GEXBot's `gamma_zero`
+   scale, and the default pick was to flag them all rather than touch
+   them. The audit found that was too pessimistic: **exactly one**
+   threshold was scale-dependent.
+
+   **Scale-invariant — audited, left alone:**
+
+   | Threshold                                     | Why it survives            |
+   | --------------------------------------------- | -------------------------- |
+   | `PERISCOPE_LOTTERY_THRESHOLDS.*.DAY_TOP_PCT`  | percentile-based           |
+   | `PERISCOPE_LOTTERY_THRESHOLDS.*.RANK_FLOOR`   | `PERCENT_RANK`-based       |
+   | `STRIKE_DIST_MIN_PTS`, `TRADE_OFFSET_PTS`     | SPX points, not dollars    |
+   | `HOLD_MINUTES`, `TP_MULTIPLE`                 | time / multiple            |
+   | `CALL_RATIO_MAX`, `QQQ_BALANCE_BADGE_MIN_ABS` | ratio / already normalized |
+   | `ENTRY_PX_MAX`                                | option price, not exposure |
+
+   So the entire lottery chain is rank/percentile-driven and needed no
+   change — the rank-based filters didn't just "survive", they were the
+   whole filter.
+
+   **`GEX_DOLLARS_MAX = 1e9` was never GEXBot-scaled.** It reads
+   `gex_target_features.gex_dollars`, which is built from
+   `gex_strike_0dte` — i.e. it has _always_ been on the UW raw-dollar
+   scale, before and after this repoint. Verified against live data: it
+   passes 27.1% of rows. Unaffected, left alone.
+
+   **Sign convention verified.** In `gex_strike_0dte`, positive net
+   gamma concentrates above spot (77.5% of above-spot strikes positive
+   vs 2.0% below) — the standard GEX convention, matching what the
+   detectors assume. `value > 0` genuinely identifies +γ nodes; there is
+   no sign-flip bug hiding in the repoint.
+
+   **The one genuinely broken threshold: `PCS_MAX_ABS_GEX = 500_000`**
+   (`api/_lib/gamma-detector.ts`, consumed by `detectPcsMonday`).
+   Semantics: "only fire on a SMALL +γ floor". It was eyeballed on
+   GEXBot's scale, its origin is undocumented (nothing in this spec or
+   the detector spec explains the 500k), and the GEXBot-era intent is
+   **unrecoverable** — `GEXBOT_API_KEY` returns 401 and
+   `periscope_snapshots` held zero gexbot rows, so there is no sample to
+   re-derive an equivalent cutoff from.
+
+   Measured on live `uw_spot` data (`gex_strike_0dte`, 56,816
+   strike-ticks), the positive-γ node population (n=22,326) is:
+
+   | pctile | value      |
+   | ------ | ---------- |
+   | p05    | 2,874      |
+   | p10    | 100,451    |
+   | p25    | 3,592,921  |
+   | p50    | 26,314,201 |
+
+   The old 500,000 constant passes **15.5%** of positive nodes — it
+   lands near p15.
+
+   **How it was ported.** The absolute constant was deleted and replaced
+   with `PCS_SMALL_WALL_PCTILE = 0.15`, applied as a quantile of the
+   **current slice's own** node values via an exported, tested pure
+   helper `smallWallCutoff(values, pctile)` (type-7 linear interpolation,
+   matching Postgres `percentile_cont` so it agrees with the
+   `PERCENTILE_CONT` percentiles used elsewhere in the codebase). Because
+   the cutoff is derived from the same numbers it filters, the gate is
+   **scale-invariant**: any future units change scales cutoff and data
+   together and changes no decision. A dedicated test multiplies every
+   node value by 1000 and asserts identical fire/no-fire outcomes — that
+   is the regression guard for this entire class of bug.
+
+   Degenerate-input policy, deliberately chosen: empty slice → no fire;
+   fewer than `PCS_MIN_NODES_FOR_PCTILE = 5` nodes → no fire (a p15 over
+   2–3 points is an interpolation between arbitrary observations, and
+   firing on an unrepresentative slice is worse than not firing on a
+   low-frequency Monday-only setup). The old `Math.abs(node.value)` was
+   dropped: `loadPositiveGammaNodes` already filters `value > 0` in SQL,
+   so it was dead weight, and on a signed input it would have folded
+   large _negative_ short-gamma ceilings into the "small floor" bucket.
+
+   **Caveat — this is a SELECTIVITY-PRESERVING PORT, not a calibration.**
+   0.15 reproduces the pass rate we were unknowingly running; nothing
+   here establishes that 15% maximises PCS edge. Real calibration is
+   still owed and requires outcomes: sweep the quantile once
+   `ws_gamma_setup_fires` has accumulated forward returns via the
+   `backfill-gamma-setup-outcomes` cron. Cf.
+   `periscope-rules-study-2026-05-21.md`, where zero rules cleared
+   F1 ≥ 0.60.
+
 2. **`positions` panel remains unavailable.** Neither UW endpoint exposes a
    positions series; the CHECK constraint still permits it. Unchanged gap.
 3. **SPX is absent from the websocket feed**, so `ws_gex_strike_expiry`

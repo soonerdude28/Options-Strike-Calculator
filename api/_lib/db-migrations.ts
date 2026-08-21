@@ -5292,4 +5292,44 @@ export const MIGRATIONS: Migration[] = [
       sql`CREATE INDEX IF NOT EXISTS idx_greek_exposure_date_ticker_ts ON greek_exposure (date, ticker, timestamp DESC)`,
     ],
   },
+  {
+    id: 191,
+    description:
+      'Add a source column to periscope_snapshots so per-strike rows from the two Unusual Whales exposure endpoints can never be mixed into one delta series (Phase 1 of docs/superpowers/specs/periscope-uw-repoint-2026-08-21.md). The GEXBot trial that fed this table expired (HTTP 401) and the table sits at 0 rows, so ingestion is being repointed onto UW — but UW serves per-strike exposure from two endpoints on different scales and units. /greek-exposure/strike-expiry returns NORMALIZED values (raw API e.g. 0.0355) and is the only one with multi-year history, so it drives the EOD backfill (source=uw_eod). /spot-exposures/expiry-strike returns RAW DOLLAR exposure (e.g. 5777737.12) at 1-min cadence and drives the live forward feed (source=uw_spot). Verified on the same strike in the same session (2026-08-20, SPX 7600): gamma is -431.96 from the EOD endpoint versus -0.10 from the spot endpoint — a ~1000x unit gap, not intraday drift. Every Periscope consumer (lottery finder, gamma-setup detector, periscope-format, periscope-synthesize) computes slice-over-slice deltas, so a backfilled EOD row landing next to a live spot row would fabricate an enormous phantom sign flip and corrupt every detector. Tagging each row by source and reading one source at a time is what keeps the two scales apart. DEFAULT gexbot keeps the legacy rows (currently none, but the column must still be NOT NULL) correct without a backfill, and the CHECK pins the vocabulary to gexbot / uw_spot / uw_eod so a typo in an adapter fails at insert time rather than silently creating a third invisible series. The migration #140 UNIQUE (captured_at, expiry, panel, strike) — auto-named periscope_snapshots_captured_at_expiry_panel_strike_key — is replaced by the same tuple plus source, because the EOD backfill and the live feed legitimately write the same (captured_at, expiry, panel, strike) and must coexist rather than one silently losing to ON CONFLICT DO NOTHING. Both constraint drops use IF EXISTS (including a drop of the new name, since Postgres has no ADD CONSTRAINT IF NOT EXISTS) so the migration is safe to replay. Finally idx_periscope_snapshots_source_lookup (source, expiry, panel, captured_at, strike) leads with source so every source-pinned read path added in Phase 6 gets an index scan; the migration #140 index (expiry, panel, captured_at, strike) stays for source-agnostic scans.',
+    statements: (sql) => [
+      sql`
+        ALTER TABLE periscope_snapshots
+        ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'gexbot'
+          CHECK (source IN ('gexbot', 'uw_spot', 'uw_eod'))
+      `,
+      sql`
+        ALTER TABLE periscope_snapshots
+        DROP CONSTRAINT IF EXISTS periscope_snapshots_captured_at_expiry_panel_strike_key
+      `,
+      sql`
+        ALTER TABLE periscope_snapshots
+        DROP CONSTRAINT IF EXISTS periscope_snapshots_captured_at_expiry_panel_strike_source_key
+      `,
+      sql`
+        ALTER TABLE periscope_snapshots
+        ADD CONSTRAINT periscope_snapshots_captured_at_expiry_panel_strike_source_key
+          UNIQUE (captured_at, expiry, panel, strike, source)
+      `,
+      sql`
+        CREATE INDEX IF NOT EXISTS idx_periscope_snapshots_source_lookup
+          ON periscope_snapshots (source, expiry, panel, captured_at, strike)
+      `,
+    ],
+  },
+  {
+    id: 192,
+    description:
+      "Widen periscope_snapshots.value from NUMERIC(14,2) to NUMERIC(20,4) so the target column matches its source column's precision and scale exactly (follow-up to migration #191, docs/superpowers/specs/periscope-uw-repoint-2026-08-21.md). The live forward feed reads gex_strike_0dte.call_charm_oi / put_charm_oi etc., which migration #47 declared DECIMAL(20,4) — 16 integer digits. Migration #140 declared the destination NUMERIC(14,2) — only 12 integer digits. Narrowing by four orders of magnitude on the way in is not a rounding concern, it is a correctness one: the adapters run every value through clampSnapshotValue(), so anything the source can legally hold but the target cannot was SATURATED to 999999999999.99 rather than rejected. A saturated row is indistinguishable from a real one once it is in the table, and it is by construction the largest magnitude present — so it would enter the lottery finder's PERCENTILE_CONT delta pool and rank first in the display Top-N as the single biggest dealer wall on the board. A fabricated extreme is worse than either the true value or an absent row, because it is silently actionable. Widening to NUMERIC(20,4) removes the failure mode at the source: no value gex_strike_0dte can store can now overflow periscope_snapshots, so the clamp degrades to an unreachable defensive backstop (kept, with SNAPSHOT_VALUE_MAX raised to the new bound). The extra two decimal places also stop silently rounding the 4-decimal source values to 2. Safe and instant: the table holds 0 rows at time of writing, and NUMERIC widening is a metadata-only ALTER that never rewrites the heap even when populated. Nothing narrows, so the change is backward-compatible with every existing reader.",
+    statements: (sql) => [
+      sql`
+        ALTER TABLE periscope_snapshots
+        ALTER COLUMN value TYPE NUMERIC(20,4)
+      `,
+    ],
+  },
 ];

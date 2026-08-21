@@ -30,6 +30,7 @@ import {
   detectPutLotteryAllForDate,
 } from '../api/_lib/periscope-lottery-finder.js';
 import type { PeriscopeLotteryFire } from '../api/_lib/periscope-lottery-types.js';
+import { SOURCE_UW_SPOT } from '../api/_lib/periscope-uw.js';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -59,10 +60,15 @@ const explicitDates = args.filter(
 
 async function getDates(): Promise<string[]> {
   if (explicitDates.length > 0) return explicitDates;
+  // Pinned to the live 1-min series. The `uw_eod` backfill holds one
+  // synthetic 15:00 CT slice per day, so those days can't produce the
+  // slice-over-slice deltas the detector needs — enumerating them would
+  // just burn the run on days that can never fire.
   const rows = (await sql`
     SELECT DISTINCT expiry::text AS d
     FROM periscope_snapshots
-    WHERE (${startDate}::date IS NULL OR expiry >= ${startDate}::date)
+    WHERE source = ${SOURCE_UW_SPOT}
+      AND (${startDate}::date IS NULL OR expiry >= ${startDate}::date)
       AND (${endDate}::date IS NULL OR expiry <= ${endDate}::date)
     ORDER BY d
   `) as { d: string }[];

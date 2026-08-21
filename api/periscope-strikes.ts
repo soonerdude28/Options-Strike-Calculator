@@ -22,6 +22,13 @@
  *   Picked slot: 300s + 60s — historical, immutable
  *
  * Auth: owner OR guest — same policy as /api/periscope-exposure.
+ *
+ * The response carries `source` — the single `periscope_snapshots`
+ * series (migration #191) every field was read from. `uw_spot` is the
+ * live raw-dollar feed, `uw_eod` the NORMALIZED EOD backfill whose
+ * gamma is ~1000x smaller, `gexbot` the dead legacy feed. Sources are
+ * never mixed inside one response, so a consumer that scales the values
+ * can branch on this.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -41,6 +48,7 @@ import {
   endOfMinute,
   fetchAvailableSlots,
   fetchSpxSpot,
+  resolveSnapshotSource,
 } from './_lib/periscope-query.js';
 import logger from './_lib/logger.js';
 import { Sentry, metrics } from './_lib/sentry.js';
@@ -141,9 +149,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           ? spotFromQuery
           : await fetchSpxSpot(date, asOf);
 
-      const availableSlots = await fetchAvailableSlots(date);
+      // One resolution feeds the slot list, the slot read and the prior
+      // slot — the Landscape diffs current vs prior, so both slots must
+      // come from the same series or every strike looks like it moved.
+      const source = await resolveSnapshotSource(date);
+      const availableSlots = await fetchAvailableSlots(date, source);
 
-      const slot = await fetchLatestPeriscopeSlot(date, asOf);
+      const slot = await fetchLatestPeriscopeSlot(date, source, asOf);
       if (slot == null) {
         done({ status: 200 });
         return res.status(200).json({
@@ -154,10 +166,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           spot,
           strikes: [],
           availableSlots,
+          source,
         });
       }
 
-      const prior = await fetchPriorPeriscopeSlot(date, slot.capturedAt);
+      const prior = await fetchPriorPeriscopeSlot(
+        date,
+        slot.capturedAt,
+        source,
+      );
 
       done({ status: 200 });
       res.status(200).json({
@@ -168,6 +185,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         spot,
         strikes: mergeStrikes(slot.gamma, slot.charm),
         availableSlots,
+        source,
       });
     } catch (error) {
       done({ status: 500, error: 'unhandled' });

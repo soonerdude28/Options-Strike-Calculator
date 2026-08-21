@@ -22,6 +22,10 @@
  */
 
 import { getDb } from './db.js';
+import {
+  resolveSnapshotSource,
+  type PeriscopeSnapshotSource,
+} from './periscope-query.js';
 
 export interface PeriscopeRow {
   strike: number;
@@ -58,60 +62,81 @@ const WIDE_SPOT_HALFWIDTH = 100;
  * Fetch the latest captured Periscope slot at or before `asOf` for the
  * given expiry. Returns null when no rows exist yet (e.g. pre-market on
  * a fresh day before the scraper's first RTH tick).
+ *
+ * `source` pins the read to ONE of migration #191's series — the three
+ * are on different scales, so a slot must never blend them. Pass the
+ * value `resolveSnapshotSource()` returned; a null source means the
+ * expiry has no rows at all, which short-circuits to null without a
+ * query.
  */
 export async function fetchLatestPeriscopeSlot(
   expiry: string,
+  source: PeriscopeSnapshotSource | null,
   asOf?: string,
 ): Promise<PeriscopeSlot | null> {
+  if (source == null) return null;
   const sql = getDb();
   const slotRows = asOf
     ? await sql`
         SELECT MAX(captured_at) AS captured_at
         FROM periscope_snapshots
-        WHERE expiry = ${expiry} AND captured_at <= ${asOf}
+        WHERE expiry = ${expiry}
+          AND source = ${source}
+          AND captured_at <= ${asOf}
       `
     : await sql`
         SELECT MAX(captured_at) AS captured_at
         FROM periscope_snapshots
-        WHERE expiry = ${expiry}
+        WHERE expiry = ${expiry} AND source = ${source}
       `;
   const capturedAt = (slotRows[0] as { captured_at: string | Date | null })
     ?.captured_at;
   if (capturedAt == null) return null;
 
-  return loadSlot(expiry, capturedAt);
+  return loadSlot(expiry, capturedAt, source);
 }
 
 /**
  * Fetch the slot immediately preceding `latestCapturedAt` for momentum /
  * sign-flip detection. Returns null when no prior slot exists in the
  * window (typically the very first RTH slot of the day).
+ *
+ * `source` MUST be the same one `fetchLatestPeriscopeSlot` used: this
+ * pair feeds the sign-flip diff, and a prior slot read from the other
+ * series would report every strike as flipped.
  */
 export async function fetchPriorPeriscopeSlot(
   expiry: string,
   latestCapturedAt: string,
+  source: PeriscopeSnapshotSource | null,
 ): Promise<PeriscopeSlot | null> {
+  if (source == null) return null;
   const sql = getDb();
   const slotRows = await sql`
     SELECT MAX(captured_at) AS captured_at
     FROM periscope_snapshots
-    WHERE expiry = ${expiry} AND captured_at < ${latestCapturedAt}
+    WHERE expiry = ${expiry}
+      AND source = ${source}
+      AND captured_at < ${latestCapturedAt}
   `;
   const capturedAt = (slotRows[0] as { captured_at: string | Date | null })
     ?.captured_at;
   if (capturedAt == null) return null;
-  return loadSlot(expiry, capturedAt);
+  return loadSlot(expiry, capturedAt, source);
 }
 
 async function loadSlot(
   expiry: string,
   capturedAt: string | Date,
+  source: PeriscopeSnapshotSource,
 ): Promise<PeriscopeSlot> {
   const sql = getDb();
   const rows = (await sql`
     SELECT panel, strike, value
     FROM periscope_snapshots
-    WHERE expiry = ${expiry} AND captured_at = ${capturedAt}
+    WHERE expiry = ${expiry}
+      AND source = ${source}
+      AND captured_at = ${capturedAt}
     ORDER BY panel, strike
   `) as Array<{ panel: string; strike: number; value: string | number }>;
 
@@ -649,7 +674,10 @@ export async function buildPeriscopeContextBlock(args: {
   spot: number;
   asOf?: string;
 }): Promise<string | null> {
-  const view = await buildPeriscopeView(args);
+  // Resolve the display source here so the analyze path gets the same
+  // uw_spot-preferred / uw_eod-fallback series the panel renders.
+  const source = await resolveSnapshotSource(args.expiry);
+  const view = await buildPeriscopeView({ ...args, source });
   if (view == null) return null;
   // formatPeriscopeForClaude takes the same shape we already have on
   // the view — pass through the original slot rows so the formatter's
@@ -668,12 +696,17 @@ export async function buildPeriscopeView(args: {
   expiry: string;
   spot: number;
   asOf?: string;
+  /** Single `periscope_snapshots.source` series to read, from
+   *  `resolveSnapshotSource()`. Required (not resolved internally) so
+   *  callers that also list available slots resolve exactly once and
+   *  cannot pin the slots and the view to different series. */
+  source: PeriscopeSnapshotSource | null;
 }): Promise<(PeriscopeView & { _formatterArgs: FormatterArgs }) | null> {
-  const { date, expiry, spot, asOf } = args;
-  const latest = await fetchLatestPeriscopeSlot(expiry, asOf);
+  const { date, expiry, spot, asOf, source } = args;
+  const latest = await fetchLatestPeriscopeSlot(expiry, source, asOf);
   if (latest == null) return null;
   const [prior, cone, breaches] = await Promise.all([
-    fetchPriorPeriscopeSlot(expiry, latest.capturedAt),
+    fetchPriorPeriscopeSlot(expiry, latest.capturedAt, source),
     fetchConeLevels(date),
     fetchConeBreaches(date, asOf),
   ]);

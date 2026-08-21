@@ -2,20 +2,37 @@
  * GET /api/periscope-map
  *
  * Deterministic Periscope "trader's map" served directly from
- * `gexbot_api_capture` at 1-min cadence. No Claude. No scraper.
+ * `gex_strike_0dte` at 1-min cadence. No Claude. No scraper.
  *
- * Replaces the Claude auto-playbook pipeline for the live MM Exposure
- * panel. The historical lookup path (`/api/periscope-exposure?date=...`)
- * stays — periscope_snapshots has the full ~6-month history that
- * GEXBot capture only covers from 2026-05-16 forward.
+ * Source of truth is the Unusual Whales spot-exposures feed
+ * (`/stock/SPX/spot-exposures/expiry-strike`, SPX 0DTE, ~1-min cadence)
+ * which a cron lands in `gex_strike_0dte`. Each tick carries every
+ * strike's call/put gamma, charm and vanna in one row set, so a single
+ * query per slot yields all three panels:
+ *
+ *   gamma = call_gamma_oi + put_gamma_oi
+ *   charm = call_charm_oi + put_charm_oi
+ *   vanna = call_vanna_oi + put_vanna_oi
+ *
+ * This endpoint used to read `gexbot_api_capture`; the GEXBot trial key
+ * expired (HTTP 401) and that table is permanently empty. The GEXBot
+ * crons + decoder are kept in place in case the subscription is renewed.
+ *
+ * The historical lookup path (`/api/periscope-exposure?date=...`) stays,
+ * reading `periscope_snapshots`. That table is fed by the 10-min adapter
+ * crons and only covers what those crons have written — it is NOT a
+ * longer history than this live path.
  *
  * Pipeline:
- *   1. Read latest gexbot_api_capture rows for SPX state/{gamma,charm,vanna}_zero
- *   2. Read prior captures from ~10 min before latest (for sign-flip detection
- *      and per-strike delta semantics in the existing view-builder)
- *   3. Decode mini_contracts -> PeriscopeRow[]
+ *   1. Read every strike of the latest `gex_strike_0dte` tick within the
+ *      staleness window (one query — all three greeks come together)
+ *   2. Read the same for the nearest tick >= PRIOR_LOOKBACK_MIN earlier
+ *      (for sign-flip detection and per-strike delta semantics in the
+ *      existing view-builder)
+ *   3. Net call+put per strike -> PeriscopeRow[] for each panel
  *   4. Build PeriscopeSlot for latest + prior
- *   5. fetchSpxSpot(today) for the spot anchor
+ *   5. Spot anchor: the tick's own `price` column, falling back to
+ *      fetchSpxSpot(today) when UW left it null
  *   6. fetchConeLevels + fetchConeBreaches (nullable; cone may not exist yet)
  *   7. computePeriscopeView() — same pure builder the analyze prompt uses
  *   8. Return { marketOpen, asOf, data, reason, availableSlots: [] }
@@ -29,6 +46,7 @@
  * Spec: docs/superpowers/specs/periscope-analyzer-build-2026-05-21.md
  *   — this is the MVP of that build. Full analyzer + structure
  *   recommendations are a follow-up.
+ * Repoint spec: docs/superpowers/specs/periscope-uw-repoint-2026-08-21.md
  */
 
 import { Sentry, metrics } from './_lib/sentry.js';
@@ -45,99 +63,195 @@ import {
   type PeriscopeRow,
   type PeriscopeView,
 } from './_lib/periscope-format.js';
-import { fetchAvailableSlots, fetchSpxSpot } from './_lib/periscope-query.js';
+import {
+  fetchAvailableSlots,
+  fetchSpxSpot,
+  resolveSnapshotSource,
+} from './_lib/periscope-query.js';
 import { getETDateStr } from '../src/utils/timezone.js';
 import logger from './_lib/logger.js';
 import {
   PANELS,
-  PANEL_TO_CATEGORY,
   PRIOR_LOOKBACK_FLOOR_MIN,
   PRIOR_LOOKBACK_MIN,
   STALENESS_CUTOFF_MS,
-  TICKER,
-  decodeStrikes,
-  type GexbotStatePayload,
   type PanelName,
 } from './_lib/periscope-gexbot.js';
+import {
+  PANEL_SOURCE_COLUMNS,
+  SOURCE_UW_SPOT,
+  netValue,
+  type UwStrikeRow,
+} from './_lib/periscope-uw.js';
 
 /**
- * Fetch the latest gexbot_api_capture row per panel within the
- * staleness window. Returns null when any panel has no fresh row.
+ * A NUMERIC column as the Neon driver hands it back: normally a string,
+ * occasionally already a number, and NULL when UW omitted it.
  */
-async function fetchLatestGexbotSlot(
+type NumericCol = string | number | null;
+
+/**
+ * One `gex_strike_0dte` row — one strike of one 1-min UW tick. The six
+ * greek legs are deliberately NOT spelled out here: they are read
+ * through `netValue()` off the shared column map, so this endpoint
+ * carries no second copy of their names.
+ */
+interface UwGexStrikeRow extends UwStrikeRow {
+  timestamp: Date | string;
+  strike: NumericCol;
+  price: NumericCol;
+}
+
+/**
+ * The `SELECT` list for one tick: the row-identity columns plus the six
+ * greek legs derived from `PANEL_SOURCE_COLUMNS` (api/_lib/periscope-uw.ts),
+ * the single copy of the UW column map. Spelling the legs out here
+ * would let this live render drift from the `uw_spot` rows the cron
+ * stores for the very same tick.
+ */
+const UW_SPOT_TICK_COLUMNS = [
+  'timestamp',
+  'strike',
+  'price',
+  ...PANELS.flatMap((panel) => {
+    const cols = PANEL_SOURCE_COLUMNS[SOURCE_UW_SPOT][panel];
+    return [cols.call, cols.put];
+  }),
+].join(', ');
+
+/** A latest/prior slot plus the spot price UW stamped on that tick. */
+interface UwSlot {
+  slot: PeriscopeSlot;
+  /** `price` from the tick — null when UW left the column empty. */
+  spot: number | null;
+}
+
+/**
+ * Coerce `strike` / `price` — the two non-greek NUMERIC columns, which
+ * the shared mapper does not cover — to a finite number. NUMERIC comes
+ * back as a string; SonarJS forbids the bare `parseFloat` global.
+ */
+function parseNumeric(raw: NumericCol | undefined): number | null {
+  if (raw == null) return null;
+  const n = typeof raw === 'number' ? raw : Number.parseFloat(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Turn one tick's rows into a `PeriscopeSlot` (all three panels) plus
+ * the tick's spot. Returns null when the tick yields no usable strike
+ * on any panel — treated the same as "no tick" by the caller.
+ */
+function buildSlotFromRows(
   date: string,
-): Promise<PeriscopeSlot | null> {
+  rows: UwGexStrikeRow[],
+): UwSlot | null {
+  if (rows.length === 0) return null;
+
+  const panels: Record<PanelName, PeriscopeRow[]> = {
+    gamma: [],
+    charm: [],
+    vanna: [],
+  };
+  let capturedAt: Date | null = null;
+  let spot: number | null = null;
+
+  for (const r of rows) {
+    const ts = new Date(r.timestamp);
+    if (
+      !Number.isNaN(ts.getTime()) &&
+      (capturedAt == null || ts > capturedAt)
+    ) {
+      capturedAt = ts;
+    }
+
+    if (spot == null) {
+      const price = parseNumeric(r.price);
+      if (price != null && price > 0) spot = price;
+    }
+
+    const strikeRaw = parseNumeric(r.strike);
+    if (strikeRaw == null) continue;
+    // PeriscopeRow.strike is an integer everywhere downstream (the
+    // GEXBot decoder rounded too) — SPX strikes are whole points.
+    const strike = Math.round(strikeRaw);
+
+    // Per-panel skip: `netValue` returns null for a half-sided or
+    // non-numeric leg, which drops the strike from THAT panel only — a
+    // bad gamma leg must not cost the strike its charm and vanna.
+    for (const panel of PANELS) {
+      const net = netValue(r, panel, SOURCE_UW_SPOT);
+      if (net != null) panels[panel].push({ strike, value: net });
+    }
+  }
+
+  if (capturedAt == null) return null;
+  if (PANELS.every((panel) => panels[panel].length === 0)) return null;
+
+  return {
+    slot: {
+      capturedAt: capturedAt.toISOString(),
+      expiry: date,
+      gamma: panels.gamma,
+      charm: panels.charm,
+      vanna: panels.vanna,
+    },
+    spot,
+  };
+}
+
+/**
+ * Every strike of the newest `gex_strike_0dte` tick for `date`, provided
+ * that tick is inside the staleness window. Outside the window we return
+ * null rather than serving numbers that no longer describe the book.
+ *
+ * The `date = ...` predicate keeps the (date, timestamp DESC) composite
+ * index driving the scan; the timestamp floor is what actually enforces
+ * freshness (and incidentally excludes the stray prior-evening snapshot
+ * the fetch cron mis-stamps onto the next trading day).
+ */
+async function fetchLatestUwSlot(date: string): Promise<UwSlot | null> {
   const sql = getDb();
   const stalenessCutoff = new Date(
     Date.now() - STALENESS_CUTOFF_MS,
   ).toISOString();
 
-  const panelRows: Record<PanelName, PeriscopeRow[] | null> = {
-    gamma: null,
-    charm: null,
-    vanna: null,
-  };
-  let latestCapturedAt: Date | null = null;
+  const rows = (await withDbRetry(
+    () => sql`
+      SELECT ${sql.unsafe(UW_SPOT_TICK_COLUMNS)}
+      FROM gex_strike_0dte
+      WHERE date = ${date}
+        AND timestamp >= ${stalenessCutoff}
+        AND timestamp = (
+          SELECT MAX(timestamp)
+          FROM gex_strike_0dte
+          WHERE date = ${date}
+            AND timestamp >= ${stalenessCutoff}
+        )
+      ORDER BY strike ASC
+    `,
+  )) as UwGexStrikeRow[];
 
-  for (const panel of PANELS) {
-    const category = PANEL_TO_CATEGORY[panel];
-    const rows = (await withDbRetry(
-      () => sql`
-        SELECT captured_at, raw_response
-        FROM gexbot_api_capture
-        WHERE ticker = ${TICKER}
-          AND endpoint = 'state'
-          AND category = ${category}
-          AND captured_at >= ${stalenessCutoff}
-        ORDER BY captured_at DESC
-        LIMIT 1
-      `,
-    )) as { captured_at: Date | string; raw_response: unknown }[];
-
-    if (rows.length === 0) {
-      // Surface which panel was stale so on-call can find the gap fast.
-      logger.warn(
-        { panel, ticker: TICKER, stalenessCutoff },
-        'periscope-map: no fresh gexbot row for panel — returning no_slot',
-      );
-      return null;
-    }
-    const row = rows[0]!;
-    const ts = new Date(row.captured_at);
-    if (latestCapturedAt == null || ts > latestCapturedAt) {
-      latestCapturedAt = ts;
-    }
-    panelRows[panel] = decodeStrikes(row.raw_response as GexbotStatePayload);
+  const built = buildSlotFromRows(date, rows);
+  if (built == null) {
+    logger.warn(
+      { date, stalenessCutoff },
+      'periscope-map: no fresh gex_strike_0dte tick — returning no_slot',
+    );
   }
-
-  if (
-    latestCapturedAt == null ||
-    panelRows.gamma == null ||
-    panelRows.charm == null ||
-    panelRows.vanna == null
-  ) {
-    return null;
-  }
-
-  return {
-    capturedAt: latestCapturedAt.toISOString(),
-    expiry: date,
-    gamma: panelRows.gamma,
-    charm: panelRows.charm,
-    vanna: panelRows.vanna,
-  };
+  return built;
 }
 
 /**
- * Fetch the most recent gexbot row per panel at-or-before
- * (latest - PRIOR_LOOKBACK_MIN). Used as the "prior slice" for
- * sign-flip detection. Returns null if no qualifying rows exist
- * (e.g. cron just started for the day).
+ * The newest tick at-or-before (latest - PRIOR_LOOKBACK_MIN), bounded
+ * below by PRIOR_LOOKBACK_FLOOR_MIN. Used as the "prior slice" for
+ * sign-flip detection. Returns null if no qualifying tick exists
+ * (e.g. the feed just started for the day).
  */
-async function fetchPriorGexbotSlot(
+async function fetchPriorUwSlot(
   date: string,
   latestCapturedAt: string,
-): Promise<PeriscopeSlot | null> {
+): Promise<UwSlot | null> {
   const sql = getDb();
   const latestMs = new Date(latestCapturedAt).getTime();
   const priorCutoff = new Date(
@@ -147,54 +261,23 @@ async function fetchPriorGexbotSlot(
     latestMs - PRIOR_LOOKBACK_FLOOR_MIN * 60_000,
   ).toISOString();
 
-  const panelRows: Record<PanelName, PeriscopeRow[] | null> = {
-    gamma: null,
-    charm: null,
-    vanna: null,
-  };
-  let priorCapturedAt: Date | null = null;
+  const rows = (await withDbRetry(
+    () => sql`
+      SELECT ${sql.unsafe(UW_SPOT_TICK_COLUMNS)}
+      FROM gex_strike_0dte
+      WHERE date = ${date}
+        AND timestamp = (
+          SELECT MAX(timestamp)
+          FROM gex_strike_0dte
+          WHERE date = ${date}
+            AND timestamp <= ${priorCutoff}
+            AND timestamp >= ${priorFloor}
+        )
+      ORDER BY strike ASC
+    `,
+  )) as UwGexStrikeRow[];
 
-  for (const panel of PANELS) {
-    const category = PANEL_TO_CATEGORY[panel];
-    const rows = (await withDbRetry(
-      () => sql`
-        SELECT captured_at, raw_response
-        FROM gexbot_api_capture
-        WHERE ticker = ${TICKER}
-          AND endpoint = 'state'
-          AND category = ${category}
-          AND captured_at <= ${priorCutoff}
-          AND captured_at >= ${priorFloor}
-        ORDER BY captured_at DESC
-        LIMIT 1
-      `,
-    )) as { captured_at: Date | string; raw_response: unknown }[];
-
-    if (rows.length === 0) return null;
-    const row = rows[0]!;
-    const ts = new Date(row.captured_at);
-    if (priorCapturedAt == null || ts > priorCapturedAt) {
-      priorCapturedAt = ts;
-    }
-    panelRows[panel] = decodeStrikes(row.raw_response as GexbotStatePayload);
-  }
-
-  if (
-    priorCapturedAt == null ||
-    panelRows.gamma == null ||
-    panelRows.charm == null ||
-    panelRows.vanna == null
-  ) {
-    return null;
-  }
-
-  return {
-    capturedAt: priorCapturedAt.toISOString(),
-    expiry: date,
-    gamma: panelRows.gamma,
-    charm: panelRows.charm,
-    vanna: panelRows.vanna,
-  };
+  return buildSlotFromRows(date, rows);
 }
 
 export default async function handler(
@@ -219,10 +302,17 @@ export default async function handler(
     // for historical replay (date picker active) — for live mode we still
     // return the day's slots so the user can step back into history without
     // first manually changing the date selector.
-    const availableSlots = await fetchAvailableSlots(date);
+    //
+    // Pinned to the SAME series `/api/periscope-exposure` will resolve
+    // for this date. An unpinned list would advertise the EOD backfill's
+    // synthetic 20:00Z slot alongside the day's `uw_spot` ticks, and
+    // clicking it would silently render the nearest `uw_spot` tick
+    // instead — a slot the exposure endpoint can never reach.
+    const slotSource = await resolveSnapshotSource(date);
+    const availableSlots = await fetchAvailableSlots(date, slotSource);
 
-    const latest = await fetchLatestGexbotSlot(date);
-    if (latest == null) {
+    const latestSlot = await fetchLatestUwSlot(date);
+    if (latestSlot == null) {
       done({ status: 200 });
       res.status(200).json({
         marketOpen,
@@ -233,8 +323,13 @@ export default async function handler(
       });
       return;
     }
+    const latest = latestSlot.slot;
 
-    const spot = await fetchSpxSpot(date, latest.capturedAt);
+    // UW stamps SPX spot on every row of the tick — prefer it (it is
+    // simultaneous with the exposures). Fall back to the 1-min candle
+    // close when the column is null.
+    const spot =
+      latestSlot.spot ?? (await fetchSpxSpot(date, latest.capturedAt));
     if (spot == null) {
       done({ status: 200 });
       res.status(200).json({
@@ -247,7 +342,8 @@ export default async function handler(
       return;
     }
 
-    const prior = await fetchPriorGexbotSlot(date, latest.capturedAt);
+    const priorSlot = await fetchPriorUwSlot(date, latest.capturedAt);
+    const prior = priorSlot?.slot ?? null;
     const cone = await fetchConeLevels(date);
     const breaches = cone ? await fetchConeBreaches(date) : [];
 
@@ -259,7 +355,7 @@ export default async function handler(
       breaches,
     });
 
-    // Staleness signal — `ageSec` is the gap between the gexbot capture
+    // Staleness signal — `ageSec` is the gap between the UW tick
     // timestamp and now. The panel can render a "stale" badge once this
     // exceeds ~90s. `priorAvailable` tells the panel whether sign-flip
     // detection had a valid prior slice (false during the first ~10

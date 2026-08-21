@@ -81,8 +81,15 @@ beforeEach(() => {
 
 describe('GET /api/periscope-exposure', () => {
   it('returns no_spot when neither query nor DB yields a spot', async () => {
-    // fetchSpxSpot returns []. fetchAvailableSlots returns [].
-    mockSql.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    // fetchSpxSpot returns []. resolveSnapshotSource finds nothing, so
+    // fetchAvailableSlots short-circuits to [] without querying (the
+    // third mock below goes unused).
+    mockSql
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { has_uw_spot: false, has_uw_eod: false, has_gexbot: false },
+      ])
+      .mockResolvedValueOnce([]);
     const { req, res } = makeReqRes();
     await handler(req, res as never);
     expect(res.statusCode).toBe(200);
@@ -91,6 +98,7 @@ describe('GET /api/periscope-exposure', () => {
       data: null,
       reason: 'no_spot',
       availableSlots: [],
+      source: null,
     });
   });
 
@@ -98,6 +106,10 @@ describe('GET /api/periscope-exposure', () => {
     mockSql
       // fetchSpxSpot — spot from index_candles_1m
       .mockResolvedValueOnce([{ close: '7337.07' }])
+      // resolveSnapshotSource — the live series has rows for the date
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       // fetchAvailableSlots — no slots yet
       .mockResolvedValueOnce([])
       // fetchLatestPeriscopeSlot — no captured_at
@@ -116,6 +128,10 @@ describe('GET /api/periscope-exposure', () => {
   it('returns full view when slot + cone exist', async () => {
     mockSql
       .mockResolvedValueOnce([{ close: '7337' }])
+      // resolveSnapshotSource — the live series has rows for the date
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       // fetchAvailableSlots — two slots
       .mockResolvedValueOnce([
         { captured_at: '2026-05-08T13:40:00Z' },
@@ -165,6 +181,10 @@ describe('GET /api/periscope-exposure', () => {
 
   it('honors the spot query param over the DB value', async () => {
     mockSql
+      // resolveSnapshotSource — the live series has rows for the date
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       // fetchAvailableSlots
       .mockResolvedValueOnce([])
       // fetchLatestPeriscopeSlot — no slot, short-circuit before cone fetches
@@ -173,9 +193,9 @@ describe('GET /api/periscope-exposure', () => {
     await handler(req, res as never);
     expect(res.statusCode).toBe(200);
     expect((res.body as { reason: string }).reason).toBe('no_slot');
-    // 2 calls: availableSlots + slot lookup. The spot query param
-    // short-circuited the index_candles_1m lookup.
-    expect(mockSql).toHaveBeenCalledTimes(2);
+    // 3 calls: source resolution + availableSlots + slot lookup. The
+    // spot query param short-circuited the index_candles_1m lookup.
+    expect(mockSql).toHaveBeenCalledTimes(3);
   });
 
   it('rejects ?date with non-YYYY-MM-DD format', async () => {
@@ -205,6 +225,10 @@ describe('GET /api/periscope-exposure', () => {
     mockSql
       // fetchSpxSpot — at-or-before asOf
       .mockResolvedValueOnce([{ close: '7388.07' }])
+      // resolveSnapshotSource — the live series has rows for the date
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       // fetchAvailableSlots
       .mockResolvedValueOnce([
         { captured_at: '2026-05-08T19:20:48.478Z' },
@@ -236,6 +260,46 @@ describe('GET /api/periscope-exposure', () => {
       '2026-05-08T19:20:48.478Z',
       '2026-05-08T19:30:48.478Z',
     ]);
+  });
+
+  it('surfaces source:uw_eod and pins every snapshot read to it on a backfill-only date', async () => {
+    mockSql
+      // fetchSpxSpot
+      .mockResolvedValueOnce([{ close: '5800' }])
+      // resolveSnapshotSource — date predates the live feed
+      .mockResolvedValueOnce([
+        { has_uw_spot: false, has_uw_eod: true, has_gexbot: true },
+      ])
+      // fetchAvailableSlots — the single synthetic 15:00 CT slot
+      .mockResolvedValueOnce([{ captured_at: '2025-03-14T20:00:00Z' }])
+      // fetchLatestPeriscopeSlot — MAX
+      .mockResolvedValueOnce([{ captured_at: '2025-03-14T20:00:00Z' }])
+      // loadSlot — normalized-scale values
+      .mockResolvedValueOnce([
+        { panel: 'gamma', strike: 5800, value: '-431.96' },
+      ])
+      // fetchPriorPeriscopeSlot — one slice per day, so no prior
+      .mockResolvedValueOnce([{ captured_at: null }])
+      // fetchConeLevels + fetchConeBreaches
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+    const { req, res } = makeReqRes({ date: '2025-03-14' });
+    await handler(req, res as never);
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { source: string }).source).toBe('uw_eod');
+
+    // Resolution probe aside, no query may reference the live series —
+    // its dollar scale is ~1000x the backfill's on gamma.
+    const snapshotCalls = mockSql.mock.calls
+      .filter((c) =>
+        (c[0] as string[]).join('?').includes('periscope_snapshots'),
+      )
+      .slice(1);
+    expect(snapshotCalls.length).toBe(4);
+    for (const call of snapshotCalls) {
+      expect(call.slice(1)).toContain('uw_eod');
+      expect(call.slice(1)).not.toContain('uw_spot');
+    }
   });
 
   it('returns 500 on unhandled error', async () => {

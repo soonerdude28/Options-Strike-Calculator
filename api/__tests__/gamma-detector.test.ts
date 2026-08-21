@@ -383,6 +383,22 @@ describe('loadPositiveGammaNodes', () => {
     expect(nodes).toEqual([]);
   });
 
+  it('pins the outer read AND the MAX(captured_at) subquery to uw_spot', async () => {
+    // Migration #191: the node value is compared against an absolute
+    // dollar threshold (PCS_MAX_ABS_GEX) and diffed slice-over-slice,
+    // so the normalized uw_eod backfill must never satisfy this read —
+    // including inside the subquery, where a 15:00 CT backfill row
+    // would otherwise win MAX(captured_at).
+    const { sql, mock } = makeMockSql([[]]);
+    await loadPositiveGammaNodes(sql, '2026-05-21');
+    const [strings, ...params] = mock.mock.calls[0] as [string[], ...unknown[]];
+    const text = strings.join('?');
+    expect(text.match(/source = /g) ?? []).toHaveLength(2);
+    expect(params.filter((p) => p === 'uw_spot')).toHaveLength(2);
+    expect(params).not.toContain('uw_eod');
+    expect(params).not.toContain('gexbot');
+  });
+
   it('exports PERISCOPE_MAX_AGE_MIN so a future loosening of the freshness window is a one-line change', () => {
     // Captures the constant in test scope so a regression in the SQL
     // freshness window (e.g. someone dropping the NOW() - INTERVAL clause)

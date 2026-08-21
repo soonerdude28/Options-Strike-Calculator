@@ -22,6 +22,7 @@ import {
   findGammaSignFlips,
   formatPeriscopeForClaude,
   fetchLatestPeriscopeSlot,
+  fetchPriorPeriscopeSlot,
   buildPeriscopeContextBlock,
   type PeriscopeSlot,
 } from '../_lib/periscope-format.js';
@@ -451,7 +452,7 @@ describe('formatPeriscopeForClaude', () => {
 describe('fetchLatestPeriscopeSlot', () => {
   it('returns null when no rows for expiry', async () => {
     mockSql.mockResolvedValueOnce([{ captured_at: null }]);
-    const out = await fetchLatestPeriscopeSlot('2026-05-08');
+    const out = await fetchLatestPeriscopeSlot('2026-05-08', 'uw_spot');
     expect(out).toBeNull();
   });
 
@@ -463,17 +464,75 @@ describe('fetchLatestPeriscopeSlot', () => {
         { panel: 'charm', strike: 7300, value: '45160.00' },
         { panel: 'vanna', strike: 7300, value: '-39105.00' },
       ]);
-    const out = await fetchLatestPeriscopeSlot('2026-05-07');
+    const out = await fetchLatestPeriscopeSlot('2026-05-07', 'uw_spot');
     expect(out).not.toBeNull();
     expect(out!.gamma).toEqual([{ strike: 7300, value: 420 }]);
     expect(out!.charm).toEqual([{ strike: 7300, value: 45160 }]);
     expect(out!.vanna).toEqual([{ strike: 7300, value: -39105 }]);
   });
+
+  it('pins BOTH the slot lookup and the row read to the given source', async () => {
+    mockSql
+      .mockResolvedValueOnce([{ captured_at: '2026-05-07T19:50:00Z' }])
+      .mockResolvedValueOnce([
+        { panel: 'gamma', strike: 7300, value: '420.00' },
+      ]);
+    await fetchLatestPeriscopeSlot('2026-05-07', 'uw_eod');
+    for (const call of mockSql.mock.calls) {
+      const [strings, ...params] = call as [string[], ...unknown[]];
+      expect(strings.join('?')).toContain('source =');
+      expect(params).toContain('uw_eod');
+      // A single-source read can never carry the other series' tag.
+      expect(params).not.toContain('uw_spot');
+    }
+  });
+
+  it('short-circuits without querying when the source resolved to null', async () => {
+    const out = await fetchLatestPeriscopeSlot('2026-05-08', null);
+    expect(out).toBeNull();
+    expect(mockSql).not.toHaveBeenCalled();
+  });
+});
+
+describe('fetchPriorPeriscopeSlot', () => {
+  it('reads the prior slot from the SAME source as the latest slot', async () => {
+    mockSql
+      .mockResolvedValueOnce([{ captured_at: '2026-05-07T19:40:00Z' }])
+      .mockResolvedValueOnce([
+        { panel: 'gamma', strike: 7300, value: '400.00' },
+      ]);
+    const out = await fetchPriorPeriscopeSlot(
+      '2026-05-07',
+      '2026-05-07T19:50:00Z',
+      'uw_spot',
+    );
+    expect(out?.capturedAt).toBe('2026-05-07T19:40:00Z');
+    for (const call of mockSql.mock.calls) {
+      const [strings, ...params] = call as [string[], ...unknown[]];
+      expect(strings.join('?')).toContain('source =');
+      expect(params).toContain('uw_spot');
+      expect(params).not.toContain('uw_eod');
+    }
+  });
+
+  it('short-circuits without querying when the source resolved to null', async () => {
+    const out = await fetchPriorPeriscopeSlot(
+      '2026-05-07',
+      '2026-05-07T19:50:00Z',
+      null,
+    );
+    expect(out).toBeNull();
+    expect(mockSql).not.toHaveBeenCalled();
+  });
 });
 
 describe('buildPeriscopeContextBlock', () => {
   it('returns null when no slot exists', async () => {
-    mockSql.mockResolvedValueOnce([{ captured_at: null }]);
+    mockSql
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
+      .mockResolvedValueOnce([{ captured_at: null }]);
     const out = await buildPeriscopeContextBlock({
       date: '2026-05-08',
       expiry: '2026-05-08',
@@ -482,8 +541,55 @@ describe('buildPeriscopeContextBlock', () => {
     expect(out).toBeNull();
   });
 
+  it('returns null without touching the snapshot tables when no source has rows', async () => {
+    mockSql.mockResolvedValueOnce([
+      { has_uw_spot: false, has_uw_eod: false, has_gexbot: false },
+    ]);
+    const out = await buildPeriscopeContextBlock({
+      date: '2026-05-08',
+      expiry: '2026-05-08',
+      spot: 7337,
+    });
+    expect(out).toBeNull();
+    // Resolution only — the slot lookup is skipped entirely.
+    expect(mockSql).toHaveBeenCalledOnce();
+  });
+
+  it('reads every slot from the single resolved source (uw_eod time-travel)', async () => {
+    mockSql
+      // resolveSnapshotSource — pre-live-feed date, backfill only
+      .mockResolvedValueOnce([
+        { has_uw_spot: false, has_uw_eod: true, has_gexbot: true },
+      ])
+      .mockResolvedValueOnce([{ captured_at: '2025-03-14T20:00:00Z' }])
+      .mockResolvedValueOnce([
+        { panel: 'gamma', strike: 7300, value: '-431.96' },
+      ])
+      // prior slot lookup
+      .mockResolvedValueOnce([{ captured_at: null }])
+      // cone_levels + cone_breach_events
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+    await buildPeriscopeContextBlock({
+      date: '2025-03-14',
+      expiry: '2025-03-14',
+      spot: 7337,
+    });
+    const snapshotCalls = mockSql.mock.calls.filter((c) =>
+      (c[0] as string[]).join('?').includes('periscope_snapshots'),
+    );
+    // Resolution probe + every snapshot read.
+    expect(snapshotCalls.length).toBeGreaterThan(1);
+    for (const call of snapshotCalls.slice(1)) {
+      const params = call.slice(1);
+      expect(params).toContain('uw_eod');
+      expect(params).not.toContain('uw_spot');
+    }
+  });
+
   it('assembles end-to-end formatted block for a real-shaped fixture', async () => {
     // Sequence:
+    //   0. resolveSnapshotSource — which `source` series to render
     //   1. latest captured_at lookup (fetchLatestPeriscopeSlot)
     //   2. latest panel rows
     //   3. Promise.all starts — sync order is prior captured_at, cone, breaches
@@ -493,6 +599,9 @@ describe('buildPeriscopeContextBlock', () => {
     //   5. cone_breach_events
     //   6. prior panel rows (resolves after prior captured_at returns)
     mockSql
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       .mockResolvedValueOnce([{ captured_at: '2026-05-07T19:50:00Z' }])
       .mockResolvedValueOnce(
         [

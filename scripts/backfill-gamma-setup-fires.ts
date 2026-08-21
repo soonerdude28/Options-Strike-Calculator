@@ -42,6 +42,7 @@ import {
   type GammaNode,
   type SignalType,
 } from '../api/_lib/gamma-detector.js';
+import { SOURCE_UW_SPOT } from '../api/_lib/periscope-uw.js';
 
 config({ path: '.env.local' });
 
@@ -151,6 +152,7 @@ async function loadPeriscopeNodes(
            strike, value
     FROM periscope_snapshots
     WHERE panel = 'gamma'
+      AND source = ${SOURCE_UW_SPOT}
       AND expiry >= ${from}::date
       AND expiry <= ${to}::date
       AND value > 0

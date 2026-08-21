@@ -20,6 +20,10 @@
  */
 
 import { getDb } from './db.js';
+import {
+  resolveSnapshotSource,
+  type PeriscopeSnapshotSource,
+} from './periscope-query.js';
 import type {
   PeriscopeExtractionResult,
   HeatMapExtraction,
@@ -75,12 +79,20 @@ function emptyFieldsWithCone(args: {
  * the latest periscope_snapshots slot at or before `readTimeIso` for
  * `expiry`. Returns [] when no rows exist (caller treats as panel
  * unavailable).
+ *
+ * `source` pins the read to one of migration #191's series — the live
+ * `uw_spot` dollar scale and the normalized `uw_eod` backfill differ by
+ * ~1000x on gamma, so a heat-map block blending them would feed Claude
+ * nonsense magnitudes. A null source (no rows for the expiry at all)
+ * short-circuits without querying.
  */
 async function fetchTopStrikes(
   expiry: string,
   panel: 'gamma' | 'charm',
   readTimeIso: string,
+  source: PeriscopeSnapshotSource | null,
 ): Promise<HeatMapStrike[]> {
+  if (source == null) return [];
   const sql = getDb();
   // Find the latest captured slot for this panel at or before
   // readTimeIso. We don't need a full slot read — only the panel's
@@ -90,6 +102,7 @@ async function fetchTopStrikes(
     FROM periscope_snapshots
     WHERE expiry = ${expiry}
       AND panel = ${panel}
+      AND source = ${source}
       AND captured_at <= ${readTimeIso}
   `) as Array<{ captured_at: string | Date | null }>;
   const capturedAt = slotRows[0]?.captured_at;
@@ -100,6 +113,7 @@ async function fetchTopStrikes(
     FROM periscope_snapshots
     WHERE expiry = ${expiry}
       AND panel = ${panel}
+      AND source = ${source}
       AND captured_at = ${capturedAt}
   `) as Array<{ panel: string; strike: number; value: string | number }>;
 
@@ -185,13 +199,16 @@ async function fetchCharmZeroStrike(
   expiry: string,
   readTimeIso: string,
   spot: number,
+  source: PeriscopeSnapshotSource | null,
 ): Promise<number | null> {
+  if (source == null) return null;
   const sql = getDb();
   const slotRows = (await sql`
     SELECT MAX(captured_at) AS captured_at
     FROM periscope_snapshots
     WHERE expiry = ${expiry}
       AND panel = 'charm'
+      AND source = ${source}
       AND captured_at <= ${readTimeIso}
   `) as Array<{ captured_at: string | Date | null }>;
   const capturedAt = slotRows[0]?.captured_at;
@@ -207,6 +224,7 @@ async function fetchCharmZeroStrike(
     FROM periscope_snapshots
     WHERE expiry = ${expiry}
       AND panel = 'charm'
+      AND source = ${source}
       AND captured_at = ${capturedAt}
       AND strike >= ${minStrike}
       AND strike <= ${maxStrike}
@@ -237,6 +255,11 @@ export interface SynthesizeResult {
   /** Pre-computed charm-zero strike (cumulative sign change), null when
    *  the cumulative sum never crosses or no charm rows exist. */
   charmZeroStrike: number | null;
+  /** Which `periscope_snapshots.source` series the heat maps came from.
+   *  `uw_eod` means normalized-scale backfill values (~1000x smaller on
+   *  gamma than the live `uw_spot` feed); null means the result is
+   *  cone-only. Additive — existing consumers may ignore it. */
+  source: PeriscopeSnapshotSource | null;
 }
 
 /**
@@ -258,12 +281,17 @@ export async function synthesizeFromDb(args: {
 }): Promise<SynthesizeResult | null> {
   const { tradingDate, readTimeIso, spot } = args;
 
+  // One resolution for all three periscope reads — gamma, charm and the
+  // charm-zero integration have to describe the same series or the
+  // prompt block contradicts itself.
+  const source = await resolveSnapshotSource(tradingDate);
+
   const [coneBounds, gexStrikes, charmStrikes, charmZeroStrike] =
     await Promise.all([
       fetchConeBounds(tradingDate),
-      fetchTopStrikes(tradingDate, 'gamma', readTimeIso),
-      fetchTopStrikes(tradingDate, 'charm', readTimeIso),
-      fetchCharmZeroStrike(tradingDate, readTimeIso, spot),
+      fetchTopStrikes(tradingDate, 'gamma', readTimeIso, source),
+      fetchTopStrikes(tradingDate, 'charm', readTimeIso, source),
+      fetchCharmZeroStrike(tradingDate, readTimeIso, spot, source),
     ]);
 
   // Gate: if we have NEITHER a cone NOR any periscope rows, the DB
@@ -291,5 +319,10 @@ export async function synthesizeFromDb(args: {
       ? { gex: gexStrikes, charm: charmStrikes }
       : null;
 
-  return { extraction, heatMaps, charmZeroStrike };
+  return {
+    extraction,
+    heatMaps,
+    charmZeroStrike,
+    source: heatMaps == null ? null : source,
+  };
 }

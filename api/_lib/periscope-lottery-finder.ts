@@ -15,6 +15,16 @@
  *
  * The cron handlers (detect-periscope-call-lottery, detect-periscope-put-lottery)
  * wrap these with withCronInstrumentation, Sentry, and the upsert call.
+ *
+ * EVERY periscope_snapshots read below is pinned to
+ * `source = 'uw_spot'` (migration #191). These are slice-over-slice
+ * deltas, and the other two series cannot legally participate: `uw_eod`
+ * is the normalized backfill with ONE synthetic 15:00 CT slice per day
+ * (~1000x smaller on gamma), so a single such row landing in the window
+ * would both fabricate a colossal delta and, being the day's last
+ * captured_at, hijack `latest_slot`. `gexbot` is the dead legacy feed
+ * on a third scale. The pin is unconditional — never a fallback — so a
+ * day with no live rows yields no fires rather than mis-scaled ones.
  */
 
 import { getDb } from './db.js';
@@ -22,6 +32,7 @@ import {
   PERISCOPE_LOTTERY_THRESHOLDS,
   type PeriscopeLotteryFire,
 } from './periscope-lottery-types.js';
+import { SOURCE_UW_SPOT } from './periscope-uw.js';
 
 type DbNumeric = string | number;
 type DbTimestamp = string | Date;
@@ -81,11 +92,13 @@ async function fetchCandidates(
       SELECT MAX(captured_at) AS captured_at
       FROM periscope_snapshots
       WHERE panel = ${panel} AND expiry = ${expiry}
+        AND source = ${SOURCE_UW_SPOT}
     ),
     prior_slot AS (
       SELECT MAX(captured_at) AS captured_at
       FROM periscope_snapshots
       WHERE panel = ${panel} AND expiry = ${expiry}
+        AND source = ${SOURCE_UW_SPOT}
         AND captured_at < (SELECT captured_at FROM latest_slot)
     ),
     pairs AS (
@@ -98,9 +111,12 @@ async function fetchCandidates(
         ON p.strike = s.strike
        AND p.expiry = s.expiry
        AND p.panel  = s.panel
+       AND p.source = s.source
+       AND p.source = ${SOURCE_UW_SPOT}
        AND p.captured_at = (SELECT captured_at FROM prior_slot)
       WHERE s.panel = ${panel}
         AND s.expiry = ${expiry}
+        AND s.source = ${SOURCE_UW_SPOT}
         AND s.captured_at = (SELECT captured_at FROM latest_slot)
     ),
     day_delta_pool AS (
@@ -108,6 +124,7 @@ async function fetchCandidates(
       SELECT (ABS(value - LAG(value) OVER (PARTITION BY strike ORDER BY captured_at))) AS abs_delta
       FROM periscope_snapshots
       WHERE panel = ${panel} AND expiry = ${expiry}
+        AND source = ${SOURCE_UW_SPOT}
     ),
     day_threshold AS (
       SELECT PERCENTILE_CONT(${quantile}) WITHIN GROUP (ORDER BY abs_delta) AS d_thresh
@@ -455,6 +472,7 @@ async function fetchAllCandidatesForExpiry(
           AS greek_delta
       FROM periscope_snapshots
       WHERE panel = ${panel} AND expiry = ${expiry}
+        AND source = ${SOURCE_UW_SPOT}
     ),
     day_threshold AS (
       SELECT PERCENTILE_CONT(${quantile})

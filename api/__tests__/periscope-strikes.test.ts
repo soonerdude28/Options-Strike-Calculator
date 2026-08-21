@@ -115,6 +115,10 @@ describe('GET /api/periscope-strikes', () => {
     mockSql
       // fetchSpxSpot — spot from DB
       .mockResolvedValueOnce([{ close: '7337.07' }])
+      // resolveSnapshotSource — live series has rows
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       // fetchAvailableSlots — no slots yet
       .mockResolvedValueOnce([])
       // fetchLatestPeriscopeSlot — MAX returns null
@@ -129,16 +133,21 @@ describe('GET /api/periscope-strikes', () => {
       spot: 7337.07,
       strikes: [],
       availableSlots: [],
+      source: 'uw_spot',
     });
     // Lock the contract: when latest slot is null, fetchPriorPeriscopeSlot
     // must NOT run — its loadSlot would crash on null capturedAt.
-    expect(mockSql).toHaveBeenCalledTimes(3);
+    expect(mockSql).toHaveBeenCalledTimes(4);
   });
 
   it('returns merged strikes when slot + prior exist', async () => {
     mockSql
       // fetchSpxSpot
       .mockResolvedValueOnce([{ close: '7337' }])
+      // resolveSnapshotSource — live series has rows
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       // fetchAvailableSlots
       .mockResolvedValueOnce([
         { captured_at: '2026-05-12T18:30:00Z' },
@@ -177,13 +186,18 @@ describe('GET /api/periscope-strikes', () => {
       { strike: 7375, gamma: 3000, charm: 33000 },
     ]);
     expect(body.availableSlots).toHaveLength(2);
-    // 6 SQL calls: spot + slots + (latest MAX + loadSlot) + (prior MAX + loadSlot).
-    expect(mockSql).toHaveBeenCalledTimes(6);
+    // 7 SQL calls: spot + source + slots + (latest MAX + loadSlot) +
+    // (prior MAX + loadSlot).
+    expect(mockSql).toHaveBeenCalledTimes(7);
   });
 
   it('returns priorCapturedAt:null when only one slot exists', async () => {
     mockSql
       .mockResolvedValueOnce([{ close: '7340' }])
+      // resolveSnapshotSource — live series has rows
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       .mockResolvedValueOnce([{ captured_at: '2026-05-12T18:30:00Z' }])
       .mockResolvedValueOnce([{ captured_at: '2026-05-12T18:30:00Z' }])
       .mockResolvedValueOnce([
@@ -198,14 +212,19 @@ describe('GET /api/periscope-strikes', () => {
       capturedAt: '2026-05-12T18:30:00Z',
       priorCapturedAt: null,
     });
-    // 5 SQL calls: spot + slots + (latest MAX + loadSlot) + prior MAX.
-    // The loadSlot for prior is NOT called when MAX returns null — locks
-    // the contract that loadSlot never runs against a null capturedAt.
-    expect(mockSql).toHaveBeenCalledTimes(5);
+    // 6 SQL calls: spot + source + slots + (latest MAX + loadSlot) +
+    // prior MAX. The loadSlot for prior is NOT called when MAX returns
+    // null — locks the contract that loadSlot never runs against a null
+    // capturedAt.
+    expect(mockSql).toHaveBeenCalledTimes(6);
   });
 
   it('honors the spot query param over the DB value', async () => {
     mockSql
+      // resolveSnapshotSource — live series has rows
+      .mockResolvedValueOnce([
+        { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+      ])
       // fetchAvailableSlots (no fetchSpxSpot — short-circuited by ?spot)
       .mockResolvedValueOnce([])
       // fetchLatestPeriscopeSlot — no slot
@@ -214,8 +233,8 @@ describe('GET /api/periscope-strikes', () => {
     await handler(req, res as never);
     expect(res.statusCode).toBe(200);
     expect((res.body as { spot: number }).spot).toBe(7400);
-    // 2 SQL calls — fetchSpxSpot was skipped.
-    expect(mockSql).toHaveBeenCalledTimes(2);
+    // 3 SQL calls — fetchSpxSpot was skipped.
+    expect(mockSql).toHaveBeenCalledTimes(3);
   });
 
   it('rejects ?date with non-YYYY-MM-DD format', async () => {
@@ -235,6 +254,46 @@ describe('GET /api/periscope-strikes', () => {
     expect(res.statusCode).toBe(400);
     expect(res.body).toMatchObject({ error: 'time must be HH:MM (CT)' });
     expect(mockSql).not.toHaveBeenCalled();
+  });
+
+  it('serves a backfill-only date from uw_eod without touching the live series', async () => {
+    mockSql
+      // fetchSpxSpot
+      .mockResolvedValueOnce([{ close: '5800' }])
+      // resolveSnapshotSource — no live rows for this date
+      .mockResolvedValueOnce([
+        { has_uw_spot: false, has_uw_eod: true, has_gexbot: false },
+      ])
+      // fetchAvailableSlots — one synthetic 15:00 CT slot
+      .mockResolvedValueOnce([{ captured_at: '2025-03-14T20:00:00Z' }])
+      // fetchLatestPeriscopeSlot — MAX
+      .mockResolvedValueOnce([{ captured_at: '2025-03-14T20:00:00Z' }])
+      // loadSlot — normalized-scale rows
+      .mockResolvedValueOnce([
+        { panel: 'gamma', strike: 5800, value: '-431.96' },
+        { panel: 'charm', strike: 5800, value: '3200795.00' },
+      ])
+      // fetchPriorPeriscopeSlot — one slice per day, no prior
+      .mockResolvedValueOnce([{ captured_at: null }]);
+    const { req, res } = makeReqRes({ date: '2025-03-14' });
+    await handler(req, res as never);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      capturedAt: '2025-03-14T20:00:00Z',
+      priorCapturedAt: null,
+      source: 'uw_eod',
+      strikes: [{ strike: 5800, gamma: -431.96, charm: 3200795 }],
+    });
+    const snapshotCalls = mockSql.mock.calls
+      .filter((c) =>
+        (c[0] as string[]).join('?').includes('periscope_snapshots'),
+      )
+      .slice(1);
+    expect(snapshotCalls.length).toBe(4);
+    for (const call of snapshotCalls) {
+      expect(call.slice(1)).toContain('uw_eod');
+      expect(call.slice(1)).not.toContain('uw_spot');
+    }
   });
 
   it('returns 500 on unhandled error', async () => {

@@ -26,7 +26,14 @@
  *   data: PeriscopeView | null,
  *   reason?: 'no_spot' | 'no_slot',
  *   availableSlots: string[],     // ISO captured_at, ascending
+ *   source: 'uw_spot' | 'uw_eod' | 'gexbot' | null,
  * }
+ *
+ * `source` names the single `periscope_snapshots` series the whole
+ * response was read from (migration #191). `uw_spot` is the live
+ * raw-dollar feed; `uw_eod` is the NORMALIZED backfill (~1000x smaller
+ * gamma) served only for dates the live feed never covered. The three
+ * series are never blended in one response.
  *
  * Auth: owner OR guest (read-only data, same policy as /api/quotes
  * and /api/spy-darkpool-levels — Periscope data is not Anthropic-gated).
@@ -47,6 +54,7 @@ import {
   endOfMinute,
   fetchAvailableSlots,
   fetchSpxSpot,
+  resolveSnapshotSource,
 } from './_lib/periscope-query.js';
 import { getETDateStr, ctWallClockToUtcIso } from '../src/utils/timezone.js';
 import logger from './_lib/logger.js';
@@ -125,7 +133,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           ? spotFromQuery
           : await fetchSpxSpot(date, asOf);
 
-      const availableSlots = await fetchAvailableSlots(date);
+      // Resolve the snapshot series ONCE and pin both the slot list and
+      // the view to it — otherwise the stepper could offer the EOD
+      // backfill's synthetic 15:00 CT slot while the view renders the
+      // live series (different scales entirely).
+      const source = await resolveSnapshotSource(date);
+      const availableSlots = await fetchAvailableSlots(date, source);
 
       if (spot == null) {
         // No spot at all — can't rank levels. Return marketOpen + null
@@ -137,6 +150,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           data: null,
           reason: 'no_spot',
           availableSlots,
+          source,
         });
       }
 
@@ -144,6 +158,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         date,
         expiry: date,
         spot,
+        source,
         ...(asOf != null ? { asOf } : {}),
       });
 
@@ -174,6 +189,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         data,
         reason: data == null ? 'no_slot' : undefined,
         availableSlots,
+        source,
       });
     } catch (error) {
       done({ status: 500, error: 'unhandled' });

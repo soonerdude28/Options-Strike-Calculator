@@ -24,8 +24,16 @@
  * use positions, so this is fine for now.
  *
  * Idempotency: `periscope_snapshots` UNIQUE
- * (captured_at, expiry, panel, strike) gives natural dedup. Re-running
- * the cron on the same minute is a no-op.
+ * (captured_at, expiry, panel, strike, source) gives natural dedup.
+ * Re-running the cron on the same minute is a no-op. Migration #191
+ * widened the original migration #140 4-column tuple with `source`, so
+ * the ON CONFLICT inference spec below MUST name `source` too — the
+ * only surviving index on the bare 4 columns is #140's non-unique
+ * `idx_periscope_snapshots_lookup`, which cannot satisfy an inference
+ * spec (Postgres 42P10). This cron writes no explicit `source`; the
+ * column's `DEFAULT 'gexbot'` is applied before conflict resolution, so
+ * legacy GEXBot rows keep their own uniqueness namespace and never
+ * collide with the `uw_spot` / `uw_eod` series.
  */
 
 import { getDb, withDbRetry } from '../_lib/db.js';
@@ -45,32 +53,15 @@ import {
   decodeStrikes,
   type GexbotStatePayload,
 } from '../_lib/periscope-gexbot.js';
+// `formatTimeframe` moved to _lib/periscope-uw so the gexbot adapter,
+// the UW adapter and the EOD backfill emit one identical slot label.
+import { formatTimeframe } from '../_lib/periscope-uw.js';
 
 export const config = { maxDuration: 30 };
 
 // Re-export for the existing test file that imports `decodeStrikes` from
 // this module. New callers should import from _lib/periscope-gexbot.
 export { decodeStrikes };
-
-/**
- * Build the "HH:MM - HH:MM" CT timeframe label matching the scraper's
- * convention. Floors `capturedAt` to the prior 10-min CT slot.
- */
-function formatTimeframe(capturedAt: Date): string {
-  const ctOpts = { timeZone: 'America/Chicago', hour12: false } as const;
-  const parts = new Intl.DateTimeFormat('en-US', {
-    ...ctOpts,
-    hour: '2-digit',
-    minute: '2-digit',
-  }).formatToParts(capturedAt);
-  const hr = Number(parts.find((p) => p.type === 'hour')?.value ?? '0');
-  const min = Number(parts.find((p) => p.type === 'minute')?.value ?? '0');
-  const slotStart = min - (min % 10);
-  const slotEnd = (slotStart + 10) % 60;
-  const slotEndHr = slotStart + 10 >= 60 ? (hr + 1) % 24 : hr;
-  const pad = (n: number): string => n.toString().padStart(2, '0');
-  return `${pad(hr)}:${pad(slotStart)} - ${pad(slotEndHr)}:${pad(slotEnd)}`;
-}
 
 export default withCronInstrumentation(
   'populate-periscope-from-gexbot',
@@ -131,7 +122,7 @@ export default withCronInstrumentation(
             unnest(${strikes}::int[]) AS strike,
             unnest(${values}::numeric[]) AS value,
             ${timeframe}
-          ON CONFLICT (captured_at, expiry, panel, strike) DO NOTHING
+          ON CONFLICT (captured_at, expiry, panel, strike, source) DO NOTHING
           RETURNING strike
         `,
       )) as { strike: number }[];

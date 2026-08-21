@@ -26,6 +26,7 @@
 import type { NeonQueryFunction } from '@neondatabase/serverless';
 
 import { withDbRetry } from './db.js';
+import { SOURCE_UW_SPOT } from './periscope-uw.js';
 import { getETDateStr } from '../../src/utils/timezone.js';
 
 type Sql = NeonQueryFunction<false, false>;
@@ -259,6 +260,14 @@ interface GammaRow {
  * Load the positive-gamma strikes from the most recent periscope snapshot
  * for today's 0DTE expiry. Returns empty array if no snapshot found within
  * PERISCOPE_MAX_AGE_MIN minutes.
+ *
+ * Pinned to `source = 'uw_spot'` (migration #191): the node's `value`
+ * is compared against the absolute PCS_MAX_ABS_GEX dollar threshold and
+ * diffed slice-over-slice downstream, so the normalized `uw_eod`
+ * backfill (~1000x smaller gamma, one synthetic 15:00 CT slice per day)
+ * and the dead `gexbot` series must never satisfy this read — a stale
+ * EOD row would otherwise win MAX(captured_at) and pass the small-wall
+ * filter on units alone.
  */
 export async function loadPositiveGammaNodes(
   sql: Sql,
@@ -272,11 +281,13 @@ export async function loadPositiveGammaNodes(
       FROM periscope_snapshots
       WHERE panel = 'gamma'
         AND expiry = ${today}::date
+        AND source = ${SOURCE_UW_SPOT}
         AND captured_at = (
           SELECT MAX(captured_at)
           FROM periscope_snapshots
           WHERE panel = 'gamma'
             AND expiry = ${today}::date
+            AND source = ${SOURCE_UW_SPOT}
             AND captured_at >= NOW() - (${PERISCOPE_MAX_AGE_MIN}::int * INTERVAL '1 minute')
         )
         AND value > 0

@@ -182,6 +182,53 @@ describe('populate-periscope-from-gexbot handler', () => {
     expect(mockSql).toHaveBeenCalledTimes(6);
   });
 
+  it('targets the migration #191 5-column UNIQUE in ON CONFLICT', async () => {
+    // Migration #191 DROPPED periscope_snapshots_captured_at_expiry_panel_strike_key
+    // and replaced it with UNIQUE (captured_at, expiry, panel, strike,
+    // source). The only surviving index on the bare 4 columns is
+    // migration #140's NON-UNIQUE idx_periscope_snapshots_lookup, which
+    // cannot satisfy an ON CONFLICT inference spec — Postgres would raise
+    // 42P10. Today that is masked because GEXBOT_API_KEY 401s upstream so
+    // the INSERT is never reached, but the crons stay scheduled against a
+    // possible subscription renewal, and withDbRetry would burn its whole
+    // retry budget on a non-retryable error.
+    const freshTimestamp = new Date(MARKET_TIME.getTime() - 60_000);
+    mockSql.mockResolvedValue([
+      {
+        captured_at: freshTimestamp,
+        raw_response: { mini_contracts: [[7435, 0, 0, 100, [], 0, null]] },
+      },
+    ]);
+
+    const req = mockRequest({
+      method: 'GET',
+      headers: { authorization: 'Bearer test-secret' },
+    });
+    await handler(req, mockResponse());
+
+    const inserts = (mockSql.mock.calls as unknown as TemplateStringsArray[][])
+      .map((call) => [...call[0]!].join('?'))
+      .filter((text) => text.includes('INSERT INTO periscope_snapshots'));
+
+    expect(inserts).toHaveLength(3);
+    for (const text of inserts) {
+      expect(text).toContain(
+        'ON CONFLICT (captured_at, expiry, panel, strike, source) DO NOTHING',
+      );
+      // The dropped 4-column tuple must never come back.
+      expect(text).not.toContain(
+        'ON CONFLICT (captured_at, expiry, panel, strike) DO NOTHING',
+      );
+    }
+    // No explicit `source` in the column list — the column's
+    // DEFAULT 'gexbot' is applied before conflict resolution.
+    for (const text of inserts) {
+      expect(text).toContain(
+        'INSERT INTO periscope_snapshots (captured_at, expiry, panel, strike, value, timeframe)',
+      );
+    }
+  });
+
   it('reports partial status when some panels missing fresh data', async () => {
     const freshTimestamp = new Date(MARKET_TIME.getTime() - 60_000);
     const samplePayload = {

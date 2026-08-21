@@ -13,6 +13,7 @@ import {
   detectCallLotteryAllForDate,
   detectPutLottery,
   detectPutLotteryAllForDate,
+  fetchCandidates,
   fetchEntryPx,
   fetchGexTarget,
   fetchLatestVix,
@@ -496,5 +497,57 @@ describe('detectPutLotteryAllForDate — historical backfill variant', () => {
     const fires = await detectPutLotteryAllForDate('2026-04-22');
     expect(fires).toHaveLength(1);
     expect(fires[0]!.eventStrike).toBe(7090);
+  });
+});
+
+// ============================================================
+// SOURCE PINNING (migration #191)
+// ============================================================
+
+describe('periscope_snapshots source pinning', () => {
+  /** (sqlText, params) of the first — and for these tests only — query. */
+  function firstCall(): { text: string; params: unknown[] } {
+    const call = mockSql.mock.calls[0] as [string[], ...unknown[]];
+    return { text: (call[0] ?? []).join('?'), params: call.slice(1) };
+  }
+
+  it('pins every CTE in the live slice-over-slice query to uw_spot', async () => {
+    mockSql.mockResolvedValueOnce([]);
+    await fetchCandidates('gamma', '2026-08-21');
+    const { text, params } = firstCall();
+    // latest_slot, prior_slot, the self-join's both sides, and the
+    // day-threshold pool — five predicates, one series.
+    expect(params.filter((p) => p === 'uw_spot')).toHaveLength(5);
+    expect(params).not.toContain('uw_eod');
+    expect(params).not.toContain('gexbot');
+    expect(text).toContain('source =');
+    // The self-join must also tie the two sides together so a future
+    // edit can't leave one side unpinned.
+    expect(text).toContain('p.source = s.source');
+  });
+
+  it('pins the charm panel query to uw_spot too', async () => {
+    mockSql.mockResolvedValueOnce([]);
+    await fetchCandidates('charm', '2026-08-21');
+    expect(firstCall().params.filter((p) => p === 'uw_spot')).toHaveLength(5);
+  });
+
+  it('pins the historical LAG-based backfill query to uw_spot', async () => {
+    mockSql.mockResolvedValueOnce([]);
+    await detectCallLotteryAllForDate('2026-08-21');
+    const { text, params } = firstCall();
+    expect(text).toContain('source =');
+    expect(params).toContain('uw_spot');
+    expect(params).not.toContain('uw_eod');
+  });
+
+  it('never falls back to another source when the day has no live rows', async () => {
+    // A uw_eod-only day must produce ZERO fires, not mis-scaled ones:
+    // the pin is unconditional, so the query simply returns nothing.
+    mockSql.mockResolvedValueOnce([]);
+    const fires = await detectPutLottery('2025-03-14');
+    expect(fires).toEqual([]);
+    expect(mockSql).toHaveBeenCalledOnce();
+    expect(firstCall().params).not.toContain('uw_eod');
   });
 });

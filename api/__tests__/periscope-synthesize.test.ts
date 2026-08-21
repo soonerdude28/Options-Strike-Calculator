@@ -48,10 +48,12 @@ function callSynthesize(overrides: SynthesizeArgs = {}) {
 }
 
 /**
- * Queue the SQL response sequence the synthesizer issues. The four
- * fetcher functions run inside `Promise.all`, so each makes its first
- * `sql\`...\`` call synchronously in the dispatch order before any
- * awaits resolve:
+ * Queue the SQL response sequence the synthesizer issues. It first
+ * resolves which `periscope_snapshots.source` series to read (migration
+ * #191), then the four fetcher functions run inside `Promise.all`, so
+ * each makes its first `sql\`...\`` call synchronously in the dispatch
+ * order before any awaits resolve:
+ *   0. resolveSnapshotSource   — EXISTS probe per source
  *   1. fetchConeBounds         — cone_levels SELECT
  *   2. fetchTopStrikes(gamma)  — MAX(captured_at) lookup
  *   3. fetchTopStrikes(charm)  — MAX(captured_at) lookup
@@ -67,6 +69,8 @@ function callSynthesize(overrides: SynthesizeArgs = {}) {
  * that case to keep the helper API uniform.
  */
 function queueAll(opts: {
+  /** Resolution row. Defaults to "live feed has rows" (uw_spot). */
+  sourceProbe?: Array<Record<string, unknown>>;
   cone: Array<Record<string, unknown>>;
   gammaSlot: Array<Record<string, unknown>>;
   charmSlot: Array<Record<string, unknown>>;
@@ -75,6 +79,12 @@ function queueAll(opts: {
   charmRows: Array<Record<string, unknown>>;
   charmZeroRows: Array<Record<string, unknown>>;
 }) {
+  // Phase 0: source resolution.
+  sqlQueue.push(
+    opts.sourceProbe ?? [
+      { has_uw_spot: true, has_uw_eod: false, has_gexbot: false },
+    ],
+  );
   // Phase 1: parallel slot lookups.
   sqlQueue.push(opts.cone, opts.gammaSlot, opts.charmSlot, opts.charmZeroSlot);
   // Phase 2: conditional row fetches. We only enqueue the row-set if the
@@ -351,5 +361,90 @@ describe('synthesizeFromDb — charm zero', () => {
     });
     const result = await callSynthesize();
     expect(result!.charmZeroStrike).toBeNull();
+  });
+});
+
+// ============================================================
+// SOURCE PINNING (migration #191)
+// ============================================================
+
+describe('synthesizeFromDb — source pinning', () => {
+  /** Every periscope_snapshots call except the resolution probe, as the
+   *  interpolated params only. The mock is typed as a zero-arg fn, so
+   *  the tagged-template arguments need a widening cast. */
+  function snapshotReadCalls(): Array<unknown[]> {
+    const calls = mockSql.mock.calls as unknown as Array<
+      [string[], ...unknown[]]
+    >;
+    return calls
+      .filter((c) => (c[0] ?? []).join('?').includes('periscope_snapshots'))
+      .slice(1)
+      .map((c) => c.slice(1));
+  }
+
+  it('tags gamma, charm and charm-zero reads with the SAME resolved source', async () => {
+    queueAll({
+      cone: [],
+      gammaSlot: [{ captured_at: '2026-08-21T18:30:00Z' }],
+      gammaRows: [{ panel: 'gamma', strike: 5820, value: 9 }],
+      charmSlot: [{ captured_at: '2026-08-21T18:30:00Z' }],
+      charmRows: [{ panel: 'charm', strike: 5820, value: -4 }],
+      charmZeroSlot: [{ captured_at: '2026-08-21T18:30:00Z' }],
+      charmZeroRows: [
+        { strike: 5750, value: -3 },
+        { strike: 5820, value: 6 },
+      ],
+    });
+
+    const result = await callSynthesize();
+    expect(result!.source).toBe('uw_spot');
+    const calls = snapshotReadCalls();
+    expect(calls.length).toBe(6);
+    for (const params of calls) {
+      expect(params).toContain('uw_spot');
+      expect(params).not.toContain('uw_eod');
+    }
+  });
+
+  it('falls back to uw_eod and never mixes in the live series', async () => {
+    queueAll({
+      sourceProbe: [{ has_uw_spot: false, has_uw_eod: true, has_gexbot: true }],
+      cone: [],
+      gammaSlot: [{ captured_at: '2025-03-14T20:00:00Z' }],
+      gammaRows: [{ panel: 'gamma', strike: 5820, value: -431.96 }],
+      charmSlot: [{ captured_at: null }],
+      charmRows: [],
+      charmZeroSlot: [{ captured_at: null }],
+      charmZeroRows: [],
+    });
+
+    const result = await callSynthesize();
+    expect(result!.source).toBe('uw_eod');
+    for (const params of snapshotReadCalls()) {
+      expect(params).toContain('uw_eod');
+      expect(params).not.toContain('uw_spot');
+    }
+  });
+
+  it('skips every snapshot query when no source has rows for the day', async () => {
+    queueAll({
+      sourceProbe: [
+        { has_uw_spot: false, has_uw_eod: false, has_gexbot: false },
+      ],
+      cone: [{ cone_lower: 5700, cone_upper: 5900 }],
+      gammaSlot: [],
+      gammaRows: [],
+      charmSlot: [],
+      charmRows: [],
+      charmZeroSlot: [],
+      charmZeroRows: [],
+    });
+
+    const result = await callSynthesize();
+    // Cone-only result — the periscope reads never ran.
+    expect(result).not.toBeNull();
+    expect(result!.heatMaps).toBeNull();
+    expect(result!.source).toBeNull();
+    expect(snapshotReadCalls()).toHaveLength(0);
   });
 });

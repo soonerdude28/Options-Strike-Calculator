@@ -13,6 +13,7 @@ the motivating analysis (76% of $1M+ "whales" are spread legs).
 
 from __future__ import annotations
 
+import logging
 import warnings
 from datetime import UTC, date, datetime, timedelta
 
@@ -21,6 +22,24 @@ import pytest
 
 import multileg_assembler
 from multileg_assembler import classify_trades
+
+# The assembler logs sub-batching decisions at DEBUG rather than raising
+# RuntimeWarning: they are routine capacity management, not anomalies, and
+# at warning level they buried every real error in the classifier service's
+# log stream (2026-08-21). `caplog` is therefore the assertion surface for
+# chunking behaviour; `pytest.warns` remains correct only for the ticker
+# skip, which drops data.
+_ASSEMBLER_LOGGER = "multileg_assembler"
+
+
+def _subbatch_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Sub-batching lines captured from the assembler's own logger."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _ASSEMBLER_LOGGER
+        and "sub-batching" in record.getMessage()
+    ]
 
 # ── Fixture helpers ─────────────────────────────────────────────────────────
 
@@ -1045,21 +1064,24 @@ def test_self_join_chunking_matches_unchunked(
     assert expected.sort("id").to_dicts() == actual.sort("id").to_dicts()
 
 
-def test_self_join_subbatch_emits_runtime_warning(
+def test_self_join_subbatch_logs_debug(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A low cap on a dense same-type bucket emits a sub-batching warning."""
+    """A low cap on a dense same-type bucket logs a sub-batching line."""
     df = _df(_dense_same_type_calls(n=1200, size=1, expiry=date(2026, 6, 12)))
     monkeypatch.setattr(multileg_assembler, "_SELF_JOIN_PAIR_CAP", 50_000)
-    with pytest.warns(RuntimeWarning, match="sub-batch"):
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         multileg_assembler.classify_trades(df, window_seconds=90)
+    assert _subbatch_messages(caplog)
 
 
-def test_self_join_small_bucket_no_subbatch_warning(
+def test_self_join_small_bucket_no_subbatch_log(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A small same-type bucket under the cap is untouched: no chunking
-    warning, and output matches the high-cap single-shot baseline."""
+    log line, and output matches the high-cap single-shot baseline."""
     df = _df(_dense_same_type_calls(n=20, size=10, expiry=date(2026, 6, 12)))
 
     monkeypatch.setattr(
@@ -1070,10 +1092,10 @@ def test_self_join_small_bucket_no_subbatch_warning(
     monkeypatch.setattr(
         multileg_assembler, "_SELF_JOIN_PAIR_CAP", 250_000
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         out = multileg_assembler.classify_trades(df, window_seconds=90)
 
+    assert _subbatch_messages(caplog) == []
     assert out.sort("id").to_dicts() == baseline.sort("id").to_dicts()
 
 
@@ -1208,21 +1230,26 @@ def test_butterfly_chunking_matches_unchunked(
     assert expected.sort("id").to_dicts() == actual.sort("id").to_dicts()
 
 
-def test_butterfly_subbatch_emits_runtime_warning(
+def test_butterfly_subbatch_logs_debug(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A low body chunk on a dense butterfly cell emits a sub-batch warning."""
+    """A low body chunk on a dense butterfly cell logs a sub-batch line."""
     df = _df(_dense_butterfly_cell(n_flies=120, expiry=date(2026, 6, 12)))
     monkeypatch.setattr(multileg_assembler, "_BUTTERFLY_BODY_CHUNK", 50)
-    with pytest.warns(RuntimeWarning, match="sub-batching dense butterfly"):
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         multileg_assembler.classify_trades(df, window_seconds=90)
+    assert any(
+        "sub-batching dense butterfly" in m for m in _subbatch_messages(caplog)
+    )
 
 
-def test_butterfly_small_cell_no_subbatch_warning(
+def test_butterfly_small_cell_no_subbatch_log(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A small butterfly cell under the chunk size is untouched: no chunking
-    warning, and output matches the high-chunk single-shot baseline."""
+    log line, and output matches the high-chunk single-shot baseline."""
     df = _df(_dense_butterfly_cell(n_flies=10, expiry=date(2026, 6, 12)))
 
     monkeypatch.setattr(
@@ -1231,10 +1258,10 @@ def test_butterfly_small_cell_no_subbatch_warning(
     baseline = multileg_assembler.classify_trades(df, window_seconds=90)
 
     monkeypatch.setattr(multileg_assembler, "_BUTTERFLY_BODY_CHUNK", 2_000)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         out = multileg_assembler.classify_trades(df, window_seconds=90)
 
+    assert _subbatch_messages(caplog) == []
     assert out.sort("id").to_dicts() == baseline.sort("id").to_dicts()
 
 
@@ -1370,22 +1397,25 @@ def test_cross_type_subbatch_output_identical_to_single_shot(
     assert chunked_matched == matched
 
 
-def test_cross_type_subbatch_emits_runtime_warning(
+def test_cross_type_subbatch_logs_debug(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A low cap on a dense bucket emits a sub-batching RuntimeWarning."""
+    """A low cap on a dense bucket logs a sub-batching line at DEBUG."""
     rows = _dense_cross_type_bucket(n_calls=120, n_puts=120)
     df = _df(rows)
 
     monkeypatch.setattr(multileg_assembler, "_CROSS_JOIN_PAIR_CAP", 2_000)
-    with pytest.warns(RuntimeWarning, match="sub-batch"):
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         classify_trades(df, window_seconds=90)
+    assert _subbatch_messages(caplog)
 
 
-def test_cross_type_small_bucket_no_subbatch_warning(
+def test_cross_type_small_bucket_no_subbatch_log(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A small bucket under the cap is untouched: no chunking warning, and
+    """A small bucket under the cap is untouched: no chunking log line, and
     output matches the default-cap baseline."""
     rows = _dense_cross_type_bucket(n_calls=8, n_puts=8)
     df = _df(rows)
@@ -1394,10 +1424,10 @@ def test_cross_type_small_bucket_no_subbatch_warning(
     baseline_sig = _grouping_signature(baseline)
 
     # Cap is 64 pairs over an 8×8 bucket; default 1M cap is far above 64.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         small = classify_trades(df, window_seconds=90)
 
+    assert _subbatch_messages(caplog) == []
     assert _grouping_signature(small) == baseline_sig
 
 
@@ -1601,6 +1631,7 @@ def test_two_leg_cross_type_single_orientation_nonempty(
 
 def test_orientation_chunk_loop_zero_chunk_continue_and_single(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Over-cap, |B|=1, chunk_rows=2 → 2 chunks. First chunk scores 0
     (``continue`` at line 922), second scores rows → single surviving chunk
@@ -1618,7 +1649,7 @@ def test_orientation_chunk_loop_zero_chunk_continue_and_single(
     )
     a = pl.DataFrame({"x": list(range(4))})  # 4 rows
     b = pl.DataFrame({"x": [0]})  # 1 row → 4*1=4 > cap 2 → chunk_rows=2
-    with pytest.warns(RuntimeWarning, match="into 2 sub-chunks"):
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         out = multileg_assembler._cross_type_scored_one_orientation(
             a=a,
             b=b,
@@ -1626,11 +1657,13 @@ def test_orientation_chunk_loop_zero_chunk_continue_and_single(
             window_seconds=90,
             size_tolerance=0.1,
         )
+    assert any("into 2 sub-chunks" in m for m in _subbatch_messages(caplog))
     assert out.height == 3  # only the second chunk contributed
 
 
 def test_orientation_chunk_loop_all_chunks_empty(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every chunk scores 0 → ``if not chunk_out`` arm (line 931) returns
     the empty 2-leg frame."""
@@ -1643,7 +1676,7 @@ def test_orientation_chunk_loop_all_chunks_empty(
     )
     a = pl.DataFrame({"x": list(range(4))})
     b = pl.DataFrame({"x": [0]})
-    with pytest.warns(RuntimeWarning):
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         out = multileg_assembler._cross_type_scored_one_orientation(
             a=a,
             b=b,
@@ -1657,6 +1690,7 @@ def test_orientation_chunk_loop_all_chunks_empty(
 
 def test_orientation_chunk_loop_per_chunk_prune(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A chunk whose scored output exceeds _PER_BATCH_PRUNE_THRESHOLD runs
     the in-loop _prune_top_k_per_trade (line 926). Lower the threshold so a
@@ -1694,7 +1728,7 @@ def test_orientation_chunk_loop_per_chunk_prune(
     )
     a = pl.DataFrame({"x": list(range(4))})  # chunk_rows=2 → 2 chunks
     b = pl.DataFrame({"x": [0]})
-    with pytest.warns(RuntimeWarning, match="into 2 sub-chunks"):
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         out = multileg_assembler._cross_type_scored_one_orientation(
             a=a,
             b=b,
@@ -1702,6 +1736,7 @@ def test_orientation_chunk_loop_per_chunk_prune(
             window_seconds=90,
             size_tolerance=0.1,
         )
+    assert any("into 2 sub-chunks" in m for m in _subbatch_messages(caplog))
     # The in-loop prune ran for each over-threshold chunk.
     assert len(prune_calls) == 2
     assert all(h == 20 for h in prune_calls)
@@ -1711,6 +1746,7 @@ def test_orientation_chunk_loop_per_chunk_prune(
 
 def test_orientation_b_over_cap_clamps_chunk_size_to_one(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When |B| itself exceeds the cap, ``cap // |B|`` would be 0; the
     ``max(1, …)`` clamp forces chunk_rows=1 (each A row is its own chunk).
@@ -1739,7 +1775,7 @@ def test_orientation_b_over_cap_clamps_chunk_size_to_one(
     )
     a = pl.DataFrame({"x": list(range(3))})  # 3 rows
     b = pl.DataFrame({"x": list(range(5))})  # |B|=5 > cap 2 → chunk_rows=1
-    with pytest.warns(RuntimeWarning, match="into 3 sub-chunks"):
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         out = multileg_assembler._cross_type_scored_one_orientation(
             a=a,
             b=b,
@@ -1747,6 +1783,7 @@ def test_orientation_b_over_cap_clamps_chunk_size_to_one(
             window_seconds=90,
             size_tolerance=0.1,
         )
+    assert any("into 3 sub-chunks" in m for m in _subbatch_messages(caplog))
     # 3 chunks, each exactly one A row → full coverage of side A, terminated.
     assert seen_a_heights == [1, 1, 1]
     assert out.height == 3  # one scored row per chunk, all concatenated
@@ -1757,6 +1794,7 @@ def test_orientation_b_over_cap_clamps_chunk_size_to_one(
 
 def test_cross_type_subbatch_three_plus_chunks_via_public_api(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """End-to-end through classify_trades: a low cap forces n_chunks >= 3 in
     at least one orientation, the loop iterates multiple times covering all
@@ -1772,19 +1810,93 @@ def test_cross_type_subbatch_three_plus_chunks_via_public_api(
     # |A|×|B| up to 60*60=3600; cap 1000 → chunk_rows = 1000 // 60 = 16 →
     # ceil(60/16) = 4 chunks (>= 3) per chunked orientation.
     monkeypatch.setattr(multileg_assembler, "_CROSS_JOIN_PAIR_CAP", 1_000)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", RuntimeWarning)
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         chunked = classify_trades(df, window_seconds=90)
 
-    msgs = [str(w.message) for w in caught]
+    msgs = _subbatch_messages(caplog)
     assert any("into 4 sub-chunks" in m for m in msgs), (
-        f"expected an n_chunks>=3 sub-batch warning, got: {msgs}"
+        f"expected an n_chunks>=3 sub-batch log line, got: {msgs}"
     )
     assert _grouping_signature(chunked) == baseline_sig
 
 
+# ── Sub-batching is routine, the ticker skip is not (2026-08-21) ─────────────
+
+
+def test_subbatch_never_raises_runtime_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunking must not surface as a RuntimeWarning.
+
+    Regression guard for the classifier log spam. Python routes
+    ``warnings.warn`` to stderr, and Railway tags every stderr line
+    ``error``, so these fired dozens of times a minute and buried real
+    errors in the service's log stream. Sub-batching is the density
+    guard working correctly — nothing is lost and nothing needs doing —
+    so it belongs at DEBUG. ``simplefilter("error")`` turns any
+    surviving RuntimeWarning into a test failure.
+
+    All three chunking paths are forced at once: same-type self-join,
+    cross-type join, and butterfly body x wing.
+    """
+    df = _df(_dense_cross_type_bucket(n_calls=60, n_puts=60))
+    monkeypatch.setattr(multileg_assembler, "_SELF_JOIN_PAIR_CAP", 100)
+    monkeypatch.setattr(multileg_assembler, "_CROSS_JOIN_PAIR_CAP", 100)
+    monkeypatch.setattr(multileg_assembler, "_BUTTERFLY_BODY_CHUNK", 2)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        classify_trades(df, window_seconds=90)
+
+
+def test_subbatch_logs_are_debug_level_not_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The sub-batching records are DEBUG, so a default-configured
+    logger drops them. This is what keeps the production log stream
+    clean: the classifier never calls ``logging.basicConfig``, and the
+    root ``lastResort`` handler is WARNING-level."""
+    df = _df(_dense_cross_type_bucket(n_calls=60, n_puts=60))
+    monkeypatch.setattr(multileg_assembler, "_CROSS_JOIN_PAIR_CAP", 100)
+
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
+        classify_trades(df, window_seconds=90)
+
+    subbatch = [
+        r
+        for r in caplog.records
+        if r.name == _ASSEMBLER_LOGGER and "sub-batching" in r.getMessage()
+    ]
+    assert subbatch, "expected at least one sub-batching record"
+    assert all(r.levelno == logging.DEBUG for r in subbatch), (
+        f"non-DEBUG sub-batching records: "
+        f"{[(r.levelname, r.getMessage()) for r in subbatch if r.levelno != logging.DEBUG]}"
+    )
+
+
+def test_ticker_skip_still_raises_runtime_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The overload skip stays a RuntimeWarning — it is real data loss.
+
+    Unlike sub-batching, this path abandons the ticker and leaves its
+    trades with null structure columns. It is rare, actionable, and an
+    offline caller can escalate it to an exception with
+    ``simplefilter("error")``. Demoting it alongside the chunking
+    notices would hide silent data loss, so this test pins the
+    distinction the log-spam fix draws.
+    """
+    df = _df(_dense_same_type_calls(n=20, size=10, expiry=date(2026, 6, 12)))
+    monkeypatch.setattr(multileg_assembler, "_MAX_CELL_ROWS_PER_CLASSIFY", 5)
+
+    with pytest.warns(RuntimeWarning, match="skipping ticker"):
+        classify_trades(df, window_seconds=90)
+
+
 def test_cross_type_subbatch_both_orientations_chunk(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Both orientations (calls-as-A and puts-as-A) independently exceed the
     cap and chunk → two sub-batch warnings per dense expiry bucket."""
@@ -1793,15 +1905,15 @@ def test_cross_type_subbatch_both_orientations_chunk(
 
     # 40*40 = 1600 > cap in BOTH orientations (sides are symmetric here).
     monkeypatch.setattr(multileg_assembler, "_CROSS_JOIN_PAIR_CAP", 500)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", RuntimeWarning)
+    with caplog.at_level(logging.DEBUG, logger=_ASSEMBLER_LOGGER):
         classify_trades(df, window_seconds=90)
 
-    subbatch_warnings = [
-        w for w in caught if "sub-batching dense cross-type" in str(w.message)
+    subbatch_logs = [
+        m for m in _subbatch_messages(caplog)
+        if "sub-batching dense cross-type" in m
     ]
     # At least two: calls-as-A chunked AND puts-as-A chunked.
-    assert len(subbatch_warnings) >= 2, (
-        f"expected both orientations to chunk (>=2 warnings), got "
-        f"{[str(w.message) for w in subbatch_warnings]}"
+    assert len(subbatch_logs) >= 2, (
+        f"expected both orientations to chunk (>=2 log lines), got "
+        f"{subbatch_logs}"
     )

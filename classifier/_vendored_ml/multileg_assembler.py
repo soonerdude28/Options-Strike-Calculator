@@ -96,6 +96,7 @@ density threshold.
 from __future__ import annotations
 
 import hashlib
+import logging
 import warnings
 from collections.abc import Iterable
 from typing import Final
@@ -104,6 +105,20 @@ import numpy as np
 import polars as pl
 
 from multileg_patterns import PATTERNS, PatternSpec
+
+# Sub-batching decisions log here at DEBUG. They were RuntimeWarnings
+# until 2026-08-21, which meant Python wrote them to stderr and the
+# classifier service's host tagged every one `error` — dozens a minute
+# on real flow, drowning anything that actually needed attention. They
+# report the density guard working correctly (no data is lost, nothing
+# needs doing), so DEBUG is the right level: invisible under the default
+# root `lastResort` handler, still available to anyone who configures
+# logging while tuning the caps.
+#
+# The ticker-overload skip deliberately stays a `warnings.warn` — that
+# one drops data, and an offline caller can escalate it to an exception
+# with `simplefilter("error")`.
+log = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -883,12 +898,15 @@ def _self_join_scored_chunked(
     # stays ~cap-sized. Partner (B) remains the full batch.
     chunk_rows = max(1, _SELF_JOIN_PAIR_CAP // n)
     n_chunks = (n + chunk_rows - 1) // chunk_rows
-    warnings.warn(
-        f"multileg matcher: sub-batching dense same-type self-join "
-        f"(batch={n:,} rows, {n * n:,} pairs > {_SELF_JOIN_PAIR_CAP:,} cap) "
-        f"into {n_chunks} sub-chunks of {chunk_rows:,} anchor rows.",
-        RuntimeWarning,
-        stacklevel=2,
+    log.debug(
+        "multileg matcher: sub-batching dense same-type self-join "
+        "(batch=%s rows, %s pairs > %s cap) into %d sub-chunks of "
+        "%s anchor rows.",
+        f"{n:,}",
+        f"{n * n:,}",
+        f"{_SELF_JOIN_PAIR_CAP:,}",
+        n_chunks,
+        f"{chunk_rows:,}",
     )
     chunk_out: list[pl.DataFrame] = []
     for start in range(0, n, chunk_rows):
@@ -1014,13 +1032,16 @@ def _cross_type_scored_one_orientation(
     # ~cap-sized. n_chunks = ceil(|a| / chunk_rows).
     chunk_rows = max(1, _CROSS_JOIN_PAIR_CAP // max(1, b.height))
     n_chunks = (a.height + chunk_rows - 1) // chunk_rows
-    warnings.warn(
-        f"multileg matcher: sub-batching dense cross-type join "
-        f"(n_calls/n_puts side-A={a.height:,}, side-B={b.height:,}, "
-        f"{a.height * b.height:,} pairs > {_CROSS_JOIN_PAIR_CAP:,} cap) "
-        f"into {n_chunks} sub-chunks of {chunk_rows:,} rows.",
-        RuntimeWarning,
-        stacklevel=2,
+    log.debug(
+        "multileg matcher: sub-batching dense cross-type join "
+        "(n_calls/n_puts side-A=%s, side-B=%s, %s pairs > %s cap) "
+        "into %d sub-chunks of %s rows.",
+        f"{a.height:,}",
+        f"{b.height:,}",
+        f"{a.height * b.height:,}",
+        f"{_CROSS_JOIN_PAIR_CAP:,}",
+        n_chunks,
+        f"{chunk_rows:,}",
     )
     chunk_out: list[pl.DataFrame] = []
     for start in range(0, a.height, chunk_rows):
@@ -1732,12 +1753,12 @@ def _butterfly_from_batch(
     # duplicate triples are removed exactly as in the single-shot path.
     n_bodies = bodies.height
     n_chunks = (n_bodies + _BUTTERFLY_BODY_CHUNK - 1) // _BUTTERFLY_BODY_CHUNK
-    warnings.warn(
-        f"multileg matcher: sub-batching dense butterfly body×wing join "
-        f"(bodies={n_bodies:,} > {_BUTTERFLY_BODY_CHUNK:,} chunk) into "
-        f"{n_chunks} body sub-chunks.",
-        RuntimeWarning,
-        stacklevel=2,
+    log.debug(
+        "multileg matcher: sub-batching dense butterfly body×wing join "
+        "(bodies=%s > %s chunk) into %d body sub-chunks.",
+        f"{n_bodies:,}",
+        f"{_BUTTERFLY_BODY_CHUNK:,}",
+        n_chunks,
     )
     chunk_out: list[pl.DataFrame] = []
     for start in range(0, n_bodies, _BUTTERFLY_BODY_CHUNK):

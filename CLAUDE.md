@@ -253,28 +253,28 @@ Turning on `exactOptionalPropertyTypes` was evaluated during the 2026-04-16 Type
 
 Required env vars (pulled via `vercel env pull .env.local`):
 
-| Variable                                   | Source                                                          |
-| ------------------------------------------ | --------------------------------------------------------------- |
-| `DATABASE_URL`                             | Neon Postgres (Vercel Marketplace)                              |
-| `KV_REST_API_URL`, `KV_REST_API_TOKEN`     | Upstash Redis (Vercel Marketplace)                              |
-| `SCHWAB_CLIENT_ID`, `SCHWAB_CLIENT_SECRET` | Schwab developer portal                                         |
-| `ANTHROPIC_API_KEY`                        | Anthropic                                                       |
-| `OPENAI_API_KEY`                           | OpenAI                                                          |
-| `SENTRY_DSN`, `SENTRY_AUTH_TOKEN`          | Sentry                                                          |
-| `CRON_SECRET`                              | Vercel (cron job auth)                                          |
-| `OWNER_SECRET`                             | Owner cookie secret (gates writes)                              |
-| `UW_API_KEY`                               | Unusual Whales                                                  |
-| `GUEST_ACCESS_KEYS`                        | Comma-separated guest keys (opt.)                               |
-| `THETA_EMAIL`, `THETA_PASSWORD`            | Theta Data (Railway sidecar only)                               |
-| `BLOB_READ_WRITE_TOKEN`                    | Vercel Blob (also on Railway)                                   |
-| `ARCHIVE_MANIFEST_URL`                     | Archive manifest (Railway only)                                 |
-| `ARCHIVE_SEED_TOKEN`                       | Gates seed POST (Railway only)                                  |
-| `ARCHIVE_ROOT`                             | Volume path; default /data/archive                              |
-| `RAILWAY_RUN_UID`                          | `0` on Railway for volume write                                 |
-| `THETA_INDEX_CONCURRENCY`                  | Sidecar /theta/index/\* slot cap (default 2, min 1)             |
-| `THETA_INDEX_WAIT_S`                       | Sidecar slot wait before 503 theta_busy (default 5.0)           |
-| `WATCHDOG_STALE_EXIT_S`                    | Sidecar exits for restart after N s of stale data (default 300) |
-| `WS_STALE_ALERT_S`                         | monitor-ws-freshness stale threshold in s (default 300)         |
+| Variable                                   | Source                                                                       |
+| ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `DATABASE_URL`                             | Neon Postgres (Vercel Marketplace)                                           |
+| `KV_REST_API_URL`, `KV_REST_API_TOKEN`     | Upstash Redis (Vercel Marketplace)                                           |
+| `SCHWAB_CLIENT_ID`, `SCHWAB_CLIENT_SECRET` | Schwab developer portal                                                      |
+| `ANTHROPIC_API_KEY`                        | Anthropic                                                                    |
+| `OPENAI_API_KEY`                           | OpenAI                                                                       |
+| `SENTRY_DSN`, `SENTRY_AUTH_TOKEN`          | Sentry                                                                       |
+| `CRON_SECRET`                              | Vercel (cron job auth)                                                       |
+| `OWNER_SECRET`                             | Owner cookie secret (gates writes)                                           |
+| `UW_API_KEY`                               | Unusual Whales                                                               |
+| `GUEST_ACCESS_KEYS`                        | Comma-separated guest keys (opt.)                                            |
+| `THETA_EMAIL`, `THETA_PASSWORD`            | Theta Data (Railway sidecar only)                                            |
+| `BLOB_READ_WRITE_TOKEN`                    | Vercel Blob (also on Railway)                                                |
+| `ARCHIVE_MANIFEST_URL`                     | Archive manifest (Railway only)                                              |
+| `ARCHIVE_SEED_TOKEN`                       | Gates seed POST (Railway only)                                               |
+| `ARCHIVE_ROOT`                             | Volume path; default /data/archive                                           |
+| `RAILWAY_RUN_UID`                          | `0` on Railway for volume write                                              |
+| `THETA_INDEX_CONCURRENCY`                  | Sidecar /theta/index/\* slot cap (default 2, min 1)                          |
+| `THETA_INDEX_WAIT_S`                       | Sidecar slot wait before 503 theta_busy (default 5.0)                        |
+| `WATCHDOG_STALE_EXIT_S`                    | Sidecar exits for restart after N s of stale data (default 300; prod is 420) |
+| `WS_STALE_ALERT_S`                         | monitor-ws-freshness stale threshold in s (default 300)                      |
 
 Never edit `.env*` files with Claude. Never commit secrets.
 

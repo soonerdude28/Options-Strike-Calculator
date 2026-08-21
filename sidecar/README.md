@@ -73,7 +73,7 @@ Sidecar is the canonical owner of these in **Railway**, not Vercel. `.env.exampl
 | `THETA_INDEX_CONCURRENCY` | optional | Cap on concurrent `/theta/index/*` calls into the Terminal (default 2, min 1). Theta Terminal v1.8.6 drops calls under bursts; excess callers queue for a slot. |
 | `THETA_INDEX_WAIT_S`    | optional  | How long a caller waits for a slot before `503 {"error":"theta_busy"}` + `Retry-After: 1` (default 5.0, clamped 0.5–60). Vercel's client allows 8s per call. |
 | `ARCHIVE_QUERY_CONCURRENCY` | optional | Cap on concurrent `/archive/*` DuckDB queries (sheds `503 archive busy` immediately when full). |
-| `WATCHDOG_STALE_EXIT_S` | optional  | Stale-data watchdog: if connected + data expected + no bar for this many seconds, the process exits 1 so Railway restarts it (default 300, min 180). |
+| `WATCHDOG_STALE_EXIT_S` | optional  | Stale-data watchdog: if connected + data expected + no bar for this many seconds, the process exits 1 so Railway restarts it (default 300, min 180). Production runs **420** — at 300 the overnight Globex session produced marginal false-positive restarts (observed 301s and 306s exits on 2026-08-20 at 18:25 and 20:45 CT, when thin ES trade flow legitimately leaves >5min between 1m bars). |
 | `WATCHDOG_BOOT_GRACE_S` | optional  | Watchdog holds off this many seconds after boot (default 600). |
 
 ## Deployment

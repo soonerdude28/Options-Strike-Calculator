@@ -399,7 +399,7 @@ function retryAfterMs(res) {
 
 // ── Mapping ─────────────────────────────────────────────────
 //
-// `mapDayRows` (all-zero skip, duplicate detection, per-panel null skip,
+// `mapDayRows` (all-zero skip, repeat-strike merging, per-panel null skip,
 // clamp accounting) and `eodCapturedAtIso` live in
 // `api/_lib/periscope-backfill-mapper.ts` so they are unit-testable —
 // see `api/__tests__/periscope-backfill-mapper.test.ts`.
@@ -473,8 +473,21 @@ async function main() {
   const startedAt = Date.now();
 
   const today = ctDateStr();
-  let cursor = opts.to ?? today;
-  if (cursor > today) cursor = today;
+  // Never start on the current session. `/greek-exposure/strike-expiry` only
+  // settles into one row per strike once the day is complete; queried
+  // intraday it returns a partial, mixed series — verified 2026-08-21, which
+  // came back with 1090 rows over 590 distinct strikes (500 duplicates,
+  // including far-OTM junk like strike 1400 against a ~7645 spot carrying a
+  // lone call_delta), versus the completed 2026-08-20 at 261 rows / 261
+  // distinct / 0 duplicates. Neither merge rule salvages that: `mapDayRows`
+  // SUMS repeat strikes (correct for the SPX+SPXW pair on a settled OPEX
+  // day), which across overlapping intraday partials would double-count the
+  // same strike instead. The current session is owned by
+  // populate-periscope-from-uw, which writes 10-min `uw_spot` slices; this
+  // backfill only ever writes settled days.
+  const lastSettled = previousWeekday(today);
+  let cursor = opts.to ?? lastSettled;
+  if (cursor > lastSettled) cursor = lastSettled;
   if (!isWeekday(cursor)) cursor = previousWeekday(cursor);
 
   console.log(
@@ -506,7 +519,7 @@ async function main() {
     zeroSkipped: 0,
     nullSkipped: 0,
     malformed: 0,
-    duplicates: 0,
+    merged: 0,
     clamped: 0,
     rowsCandidate: 0,
     rowsInserted: 0,
@@ -585,7 +598,7 @@ async function main() {
     totals.zeroSkipped += mapped.stats.zeroSkipped;
     totals.nullSkipped += mapped.stats.nullSkipped;
     totals.malformed += mapped.stats.malformed;
-    totals.duplicates += mapped.stats.duplicates;
+    totals.merged += mapped.stats.merged;
     totals.clamped += mapped.stats.clamped;
     totals.rowsCandidate += candidateRows;
     totals.rowsInserted += insertedRows;
@@ -593,7 +606,7 @@ async function main() {
     const extras = [
       mapped.stats.nullSkipped > 0 ? `null=${mapped.stats.nullSkipped}` : null,
       mapped.stats.malformed > 0 ? `bad=${mapped.stats.malformed}` : null,
-      mapped.stats.duplicates > 0 ? `dupe=${mapped.stats.duplicates}` : null,
+      mapped.stats.merged > 0 ? `merged=${mapped.stats.merged}` : null,
       mapped.stats.clamped > 0 ? `clamped=${mapped.stats.clamped}` : null,
     ].filter(Boolean);
 
@@ -603,7 +616,7 @@ async function main() {
     const extrasNote = extras.length > 0 ? `  [${extras.join(' ')}]` : '';
 
     console.log(
-      `  ${cursor}  strikes=${mapped.stats.fetched} ` +
+      `  ${cursor}  fetched=${mapped.stats.fetched} ` +
         `kept=${mapped.stats.kept} zero-skipped=${mapped.stats.zeroSkipped} ` +
         `rows=${candidateRows} ${insertedNote}${extrasNote}` +
         `  @ ${capturedAtIso}`,
@@ -627,12 +640,15 @@ async function main() {
     `  Days empty:           ${totals.daysEmpty} (holiday / not yet published)`,
   );
   console.log(`  Days failed:          ${totals.daysFailed}`);
-  console.log(`  Strikes returned:     ${totals.fetched}`);
-  console.log(`  Strikes kept:         ${totals.strikesKept}`);
+  console.log(`  Rows returned:        ${totals.fetched}`);
+  console.log(`  Strikes kept:         ${totals.strikesKept} (distinct)`);
   console.log(`  Strikes all-zero:     ${totals.zeroSkipped} (skipped)`);
   console.log(`  Strikes unusable:     ${totals.nullSkipped} (null netValue)`);
-  console.log(`  Strikes malformed:    ${totals.malformed}`);
-  console.log(`  Duplicate strikes:    ${totals.duplicates}`);
+  console.log(`  Rows malformed:       ${totals.malformed}`);
+  console.log(
+    `  Rows merged:          ${totals.merged} ` +
+      `(repeat strikes summed, e.g. SPX+SPXW on monthly OPEX)`,
+  );
   console.log(`  Values clamped:       ${totals.clamped}`);
   console.log(`  Rows candidate:       ${totals.rowsCandidate}`);
   console.log(

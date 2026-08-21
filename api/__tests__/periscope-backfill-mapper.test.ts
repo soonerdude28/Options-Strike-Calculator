@@ -68,7 +68,7 @@ describe('mapDayRows', () => {
       zeroSkipped: 0,
       nullSkipped: 0,
       malformed: 0,
-      duplicates: 0,
+      merged: 0,
       clamped: 0,
     });
   });
@@ -198,36 +198,223 @@ describe('mapDayRows', () => {
     });
   });
 
-  describe('duplicate strikes', () => {
-    it('keeps the first copy, counts the second, and writes it once', () => {
+  describe('repeat strikes are SUMMED, not discarded', () => {
+    // The bug this whole block exists to prevent: on a monthly OPEX Friday
+    // SPX carries both the AM-settled monthly (SPX) and the PM-settled
+    // weekly (SPXW) expiring on the same date, and UW returns them as two
+    // rows for the same strike with NOTHING in the payload distinguishing
+    // them. Keeping only the first silently dropped ~half the dealer
+    // exposure at that strike on 35 of 760 backfilled days.
+    it('sums both series for the 2026-07-17 OPEX strike 7005 regression', () => {
+      // Verbatim from the live payload (2026-07-17, an OPEX Friday).
+      const seriesA = makeRow({
+        date: '2026-07-17',
+        expiry: '2026-07-17',
+        strike: '7005',
+        call_gex: '0.0474',
+        put_gex: '-3.1941',
+        call_charm: '4862.47',
+        put_charm: '337722.98',
+        call_vanna: '-613.82',
+        put_vanna: '-42789.04',
+      });
+      const seriesB = makeRow({
+        date: '2026-07-17',
+        expiry: '2026-07-17',
+        strike: '7005',
+        call_gex: '0.0047',
+        put_gex: '-1.8827',
+        call_charm: '10236.72',
+        put_charm: '4125389.12',
+        call_vanna: '-286.90',
+        put_vanna: '-115714.06',
+      });
+
+      const mapped = mapDayRows([seriesA, seriesB]);
+
+      expect(mapped.panels).toEqual(['gamma', 'charm', 'vanna']);
+      expect(mapped.strikes).toEqual([7005, 7005, 7005]);
+      // gamma: (0.0474 - 3.1941) + (0.0047 - 1.8827)
+      expect(mapped.values[0]).toBeCloseTo(-5.0247, 10);
+      // charm: (4862.47 + 337722.98) + (10236.72 + 4125389.12)
+      expect(mapped.values[1]).toBeCloseTo(4478211.29, 6);
+      // vanna: (-613.82 - 42789.04) + (-286.90 - 115714.06)
+      expect(mapped.values[2]).toBeCloseTo(-159403.82, 6);
+
+      // Guard against a regression to keep-first-seen: every panel's total
+      // is strictly larger in magnitude than series A alone.
+      const seriesAOnly = mapDayRows([seriesA]);
+      expect(seriesAOnly.values).toHaveLength(mapped.values.length);
+      const grew = mapped.values.map(
+        (value, i) => Math.abs(value) > Math.abs(seriesAOnly.values[i] ?? 0),
+      );
+      expect(grew).toEqual([true, true, true]);
+
+      expect(mapped.stats).toEqual({
+        fetched: 2,
+        kept: 1,
+        zeroSkipped: 0,
+        nullSkipped: 0,
+        malformed: 0,
+        merged: 1,
+        clamped: 0,
+      });
+    });
+
+    it('sums three or more rows for the same strike', () => {
+      const mapped = mapDayRows([
+        makeRow({ strike: '6400', call_gex: '10', put_gex: '0' }),
+        makeRow({ strike: '6400', call_gex: '20', put_gex: '0' }),
+        makeRow({ strike: '6400', call_gex: '30', put_gex: '-5' }),
+      ]);
+
+      expect(mapped.strikes).toEqual([6400, 6400, 6400]);
+      // gamma 10 + 20 + 25; charm 25 * 3; vanna -5 * 3
+      expect(mapped.values).toEqual([55, 75, -15]);
+      expect(mapped.stats.kept).toBe(1);
+      expect(mapped.stats.merged).toBe(2);
+    });
+
+    it('merges strikes that collide only after rounding to INT', () => {
+      // 7005.4 and 7004.6 both round to 7005 — the same wall, so their
+      // exposures add rather than one displacing the other.
+      const mapped = mapDayRows([
+        makeRow({ strike: '7005.4', call_gex: '100', put_gex: '0' }),
+        makeRow({ strike: '7004.6', call_gex: '7', put_gex: '0' }),
+      ]);
+
+      expect(mapped.strikes).toEqual([7005, 7005, 7005]);
+      expect(mapped.values[0]).toBe(107);
+      expect(mapped.stats.kept).toBe(1);
+      expect(mapped.stats.merged).toBe(1);
+    });
+
+    it('keeps a strike that is non-zero in row A and all-zero in row B', () => {
       const mapped = mapDayRows([
         makeRow({ strike: '6400' }),
-        makeRow({ strike: '6400', call_gex: '999999' }),
+        makeZeroRow('6400'),
       ]);
 
-      expect(mapped.strikes).toEqual([6400, 6400, 6400]);
+      expect(mapped.panels).toEqual(['gamma', 'charm', 'vanna']);
+      // Adding an all-zero series is a no-op — the total is row A exactly.
       expect(mapped.values).toEqual([600.25, 25, -5]);
       expect(mapped.stats.kept).toBe(1);
-      expect(mapped.stats.duplicates).toBe(1);
+      expect(mapped.stats.zeroSkipped).toBe(0);
+      expect(mapped.stats.merged).toBe(1);
     });
 
-    it('treats strikes that collide only after rounding as duplicates', () => {
+    it('keeps a strike that is all-zero in row A and non-zero in row B', () => {
+      // The dangerous ordering under keep-first-seen: the empty series
+      // arrived first and the real exposure was thrown away.
       const mapped = mapDayRows([
-        makeRow({ strike: '6400.2' }),
-        makeRow({ strike: '6399.8' }),
+        makeZeroRow('6400'),
+        makeRow({ strike: '6400' }),
       ]);
 
+      expect(mapped.values).toEqual([600.25, 25, -5]);
       expect(mapped.stats.kept).toBe(1);
-      expect(mapped.stats.duplicates).toBe(1);
-      expect(mapped.strikes).toEqual([6400, 6400, 6400]);
+      expect(mapped.stats.zeroSkipped).toBe(0);
     });
 
-    it('does not count an all-zero repeat as a duplicate', () => {
-      // The all-zero skip fires first, so the strike is never marked seen.
+    it('skips a strike whose two rows cancel to exactly zero', () => {
+      // Individually substantial, jointly flat — the aggregate is what the
+      // dealer actually has to hedge, so there is nothing to record.
+      const mapped = mapDayRows([
+        makeRow({
+          strike: '7000',
+          call_gex: '500',
+          put_gex: '0',
+          call_charm: '2',
+          put_charm: '0',
+          call_vanna: '-9',
+          put_vanna: '0',
+        }),
+        makeRow({
+          strike: '7000',
+          call_gex: '-500',
+          put_gex: '0',
+          call_charm: '-2',
+          put_charm: '0',
+          call_vanna: '9',
+          put_vanna: '0',
+        }),
+      ]);
+
+      expect(mapped.panels).toEqual([]);
+      expect(mapped.stats.kept).toBe(0);
+      expect(mapped.stats.zeroSkipped).toBe(1);
+      expect(mapped.stats.merged).toBe(1);
+    });
+
+    it('emits the contribution of a panel that is null in the other row', () => {
+      const mapped = mapDayRows([
+        makeRow({ strike: '6400', put_charm: null }),
+        makeRow({ strike: '6400', call_gex: null, call_vanna: 'n/a' }),
+      ]);
+
+      expect(mapped.panels).toEqual(['gamma', 'charm', 'vanna']);
+      // gamma: only row A (row B's call leg is null) → 600.25
+      // charm: only row B (row A's put leg is null) → 25
+      // vanna: only row A (row B's call leg is non-numeric) → -5
+      expect(mapped.values).toEqual([600.25, 25, -5]);
+      expect(mapped.stats.kept).toBe(1);
+      expect(mapped.stats.nullSkipped).toBe(0);
+    });
+
+    it('counts a strike once as nullSkipped when every row is unusable', () => {
+      const unusable = { call_gex: null, call_charm: null, call_vanna: null };
+      const mapped = mapDayRows([
+        makeRow({ strike: '6400', ...unusable }),
+        makeRow({ strike: '6400', ...unusable }),
+      ]);
+
+      expect(mapped.panels).toEqual([]);
+      // Per DISTINCT strike, not per row.
+      expect(mapped.stats.nullSkipped).toBe(1);
+      expect(mapped.stats.merged).toBe(1);
+      expect(mapped.stats.kept).toBe(0);
+      expect(mapped.stats.zeroSkipped).toBe(0);
+    });
+
+    it('counts a repeated all-zero strike once as zeroSkipped', () => {
       const mapped = mapDayRows([makeZeroRow('9000'), makeZeroRow('9000')]);
 
-      expect(mapped.stats.zeroSkipped).toBe(2);
-      expect(mapped.stats.duplicates).toBe(0);
+      // One distinct strike, two rows: skipped once, merged once.
+      expect(mapped.stats.zeroSkipped).toBe(1);
+      expect(mapped.stats.merged).toBe(1);
+      expect(mapped.panels).toEqual([]);
+    });
+  });
+
+  describe('deterministic output ordering', () => {
+    it('emits strikes in first-appearance order, panels in EOD_PANELS order', () => {
+      const mapped = mapDayRows([
+        makeRow({ strike: '6500' }),
+        makeRow({ strike: '6400' }),
+        // A repeat of 6500 must NOT move it after 6400.
+        makeRow({ strike: '6500', call_gex: '1', put_gex: '0' }),
+        makeRow({ strike: '6600' }),
+      ]);
+
+      expect(mapped.strikes).toEqual([
+        6500, 6500, 6500, 6400, 6400, 6400, 6600, 6600, 6600,
+      ]);
+      expect(mapped.panels).toEqual([
+        ...EOD_PANELS,
+        ...EOD_PANELS,
+        ...EOD_PANELS,
+      ]);
+    });
+
+    it('is stable across repeated runs on the same payload', () => {
+      const payload = [
+        makeRow({ strike: '6500' }),
+        makeRow({ strike: '6400' }),
+        makeRow({ strike: '6500', call_charm: '11' }),
+        makeZeroRow('9000'),
+      ];
+
+      expect(mapDayRows(payload)).toEqual(mapDayRows(payload));
     });
   });
 
@@ -307,6 +494,37 @@ describe('mapDayRows', () => {
       expect(mapped.stats.clamped).toBe(0);
     });
 
+    it('clamps the SUM, not the addends', () => {
+      // Each addend is well inside the column bound; only their total is
+      // out of range. Clamping addends first would let 1.2x the ceiling
+      // through — exactly the overflow the clamp exists to prevent.
+      const half = SNAPSHOT_VALUE_MAX * 0.6;
+      const mapped = mapDayRows([
+        makeRow({ strike: '6400', call_gex: half, put_gex: '0' }),
+        makeRow({ strike: '6400', call_gex: half, put_gex: '0' }),
+      ]);
+
+      expect(half).toBeLessThan(SNAPSHOT_VALUE_MAX);
+      expect(mapped.values[0]).toBe(SNAPSHOT_VALUE_MAX);
+      // One clamp for the one final value, not one per addend.
+      expect(mapped.stats.clamped).toBe(1);
+      expect(mapped.stats.kept).toBe(1);
+      // In-range panels are untouched by the clamp.
+      expect(mapped.values[1]).toBe(50);
+      expect(mapped.values[2]).toBe(-10);
+    });
+
+    it('does not clamp a sum that stays in range', () => {
+      const half = SNAPSHOT_VALUE_MAX * 0.4;
+      const mapped = mapDayRows([
+        makeRow({ strike: '6400', call_gex: half, put_gex: '0' }),
+        makeRow({ strike: '6400', call_gex: half, put_gex: '0' }),
+      ]);
+
+      expect(mapped.values[0]).toBe(half + half);
+      expect(mapped.stats.clamped).toBe(0);
+    });
+
     it('counts one clamp per panel, not per strike', () => {
       const mapped = mapDayRows([
         makeRow({
@@ -343,9 +561,41 @@ describe('mapDayRows', () => {
       zeroSkipped: 1,
       nullSkipped: 1,
       malformed: 1,
-      duplicates: 1,
+      merged: 1,
       clamped: 0,
     });
+    // The two 6400 rows were summed, not deduped.
+    expect(mapped.values).toEqual([1200.5, 50, -10]);
+  });
+
+  it('accounts for every row exactly once', () => {
+    // fetched === malformed + merged + (kept + zeroSkipped + nullSkipped).
+    // Each row is malformed, a strike's first appearance, or a merge; each
+    // distinct strike lands in exactly one of the three outcomes.
+    const mapped = mapDayRows([
+      makeRow({ strike: '6400' }),
+      makeRow({ strike: '6400' }),
+      makeRow({ strike: '6500' }),
+      makeZeroRow('9000'),
+      makeZeroRow('9000'),
+      makeRow({ strike: 'ATM' }),
+      null,
+      makeRow({
+        strike: '6600',
+        call_gex: null,
+        call_charm: '',
+        put_vanna: 'x',
+      }),
+    ]);
+
+    const s = mapped.stats;
+    expect(s.fetched).toBe(8);
+    expect(
+      s.malformed + s.merged + s.kept + s.zeroSkipped + s.nullSkipped,
+    ).toBe(s.fetched);
+    // kept counts DISTINCT strikes emitted, and each emits one row per panel.
+    expect(mapped.strikes.length).toBe(s.kept * EOD_PANELS.length);
+    expect(new Set(mapped.strikes).size).toBe(s.kept);
   });
 });
 

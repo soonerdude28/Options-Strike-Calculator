@@ -47,21 +47,29 @@ export const HISTORY_FLOOR_CODE = 'historic_data_access_missing';
 /** First YYYY-MM-DD found in the 403 message ("The earliest date ..."). */
 const DATE_IN_TEXT_RE = /\d{4}-\d{2}-\d{2}/;
 
-/** Per-day accounting, surfaced in the per-day log line and the totals. */
+/**
+ * Per-day accounting, surfaced in the per-day log line and the totals.
+ *
+ * Invariant, useful as a sanity check on any payload:
+ * `fetched === malformed + merged + kept + zeroSkipped + nullSkipped`.
+ * Every row is either malformed, the first appearance of a strike (and
+ * that strike ends up in exactly one of kept / zeroSkipped /
+ * nullSkipped), or a repeat folded into an earlier strike.
+ */
 export interface MapDayStats {
-  /** Strikes UW returned for the day. */
+  /** Rows UW returned for the day (`rows.length`, always). */
   fetched: number;
-  /** Strikes that produced at least one written row. */
+  /** DISTINCT strikes that produced at least one written row. */
   kept: number;
-  /** Strikes where gamma, charm AND vanna were all exactly 0. */
+  /** Distinct strikes whose AGGREGATED gamma, charm and vanna are all 0. */
   zeroSkipped: number;
-  /** Strikes where every panel's `netValue` was null. */
+  /** Distinct strikes where no contributing row yielded any usable panel. */
   nullSkipped: number;
   /** Rows whose `strike` could not be parsed as a finite number. */
   malformed: number;
-  /** Repeat strikes within one day's payload. */
-  duplicates: number;
-  /** Individual values saturated by `clampSnapshotValue`. */
+  /** Repeat rows folded (summed) into a strike already seen this payload. */
+  merged: number;
+  /** Aggregated values saturated by `clampSnapshotValue`. */
   clamped: number;
 }
 
@@ -91,15 +99,49 @@ function parseStrike(raw: unknown): number | null {
  * Map one day's UW rows into flat (panel, strike, value) arrays ready
  * for the `unnest` insert.
  *
- * Skips, in order:
- *  - unparseable strikes (malformed payload row)
- *  - strikes where every panel's `netValue` is null (no usable side)
- *  - ALL-ZERO strikes: gamma, charm AND vanna exactly 0. Roughly half
- *    of what UW returns is the deep-wing tail where no contracts exist;
- *    those rows carry no information and only bloat the table.
- *  - duplicate strikes within the same payload (`ON CONFLICT DO NOTHING`
- *    would drop them silently, so they are counted instead)
- *  - individual panels whose `netValue` is null (one-sided / non-numeric)
+ * # Repeat strikes are SUMMED, not discarded
+ *
+ * On a monthly OPEX Friday (the third Friday) SPX has BOTH the
+ * AM-settled monthly (SPX) and the PM-settled weekly (SPXW) expiring on
+ * the same date, and `/greek-exposure/strike-expiry` returns each series
+ * as its OWN row for the same strike. Nothing in the payload
+ * distinguishes them — the response keys are exactly date, expiry,
+ * strike, call_gex, put_gex, call_delta, put_delta, call_charm,
+ * put_charm, call_vanna, put_vanna, dte.
+ *
+ * Verified live on 2026-07-17, strike 7005: two rows, both substantial
+ * and materially different (put_charm 337,722.98 vs 4,125,389.12). The
+ * previous keep-first-seen behaviour silently dropped roughly half the
+ * dealer exposure at every such strike, across 35 of 760 backfilled days.
+ *
+ * Summing is the economically correct merge: the panel value is already
+ * a net (call + put), exposures are additive, and dealers hedge their
+ * TOTAL exposure at a strike regardless of which expiring series it came
+ * from.
+ *
+ * # Order of operations
+ *
+ * 1. Rows are accumulated into `strike → panel → running total`, in
+ *    first-appearance order for strikes.
+ * 2. A panel whose `netValue` is null (one-sided / non-numeric leg)
+ *    contributes NOTHING — it neither zeroes nor creates the
+ *    accumulator, so a panel present in row A and null in row B still
+ *    emits row A's contribution.
+ * 3. Each strike is then judged on its AGGREGATE:
+ *    - no panel accumulated anything → `nullSkipped` (no usable side in
+ *      any contributing row).
+ *    - every accumulated panel totals exactly 0 → `zeroSkipped`. Roughly
+ *      half of what UW returns is the deep-wing tail where no contracts
+ *      exist; those rows carry no information and only bloat the table.
+ *      Two rows that individually carry value but cancel to exactly zero
+ *      are genuinely flat and get skipped too.
+ *    - otherwise emitted, panels in `EOD_PANELS` order.
+ * 4. `clampSnapshotValue` is applied to the FINAL SUM, never to an
+ *    addend — clamping the parts and then adding them could exceed the
+ *    column bound the clamp exists to enforce.
+ *
+ * Output ordering is fully deterministic (strike first-appearance ×
+ * `EOD_PANELS`), so the emitted arrays are stable across runs.
  */
 export function mapDayRows(rows: readonly unknown[]): MappedDay {
   const panels: PanelName[] = [];
@@ -111,10 +153,13 @@ export function mapDayRows(rows: readonly unknown[]): MappedDay {
     zeroSkipped: 0,
     nullSkipped: 0,
     malformed: 0,
-    duplicates: 0,
+    merged: 0,
     clamped: 0,
   };
-  const seen = new Set<number>();
+
+  // Insertion-ordered: strike → panel → running (unclamped) total.
+  // A Map preserves first-appearance order, which is the emit order.
+  const totals = new Map<number, Map<PanelName, number>>();
 
   for (const raw of rows) {
     if (!isRecord(raw)) {
@@ -126,41 +171,52 @@ export function mapDayRows(rows: readonly unknown[]): MappedDay {
       stats.malformed += 1;
       continue;
     }
-    // `periscope_snapshots.strike` is INT.
+    // `periscope_snapshots.strike` is INT. Two source strikes that
+    // collide only after rounding are the same wall and merge too.
     const strike = Math.round(rawStrike);
 
-    const nets = new Map<PanelName, number>();
-    let anyUsable = false;
-    let anyNonZero = false;
+    let byPanel = totals.get(strike);
+    if (byPanel == null) {
+      byPanel = new Map<PanelName, number>();
+      totals.set(strike, byPanel);
+    } else {
+      stats.merged += 1;
+    }
 
     for (const panel of EOD_PANELS) {
       const net = netValue(raw, panel, SOURCE_UW_EOD);
+      // null = this row has no usable value for this panel. Skipping
+      // (rather than adding 0) keeps another row's contribution intact.
       if (net == null) continue;
-      nets.set(panel, net);
-      anyUsable = true;
-      if (net !== 0) anyNonZero = true;
+      // Seeding from 0 also normalises a lone -0 addend to +0.
+      byPanel.set(panel, (byPanel.get(panel) ?? 0) + net);
     }
+  }
 
-    if (!anyUsable) {
+  for (const [strike, byPanel] of totals) {
+    if (byPanel.size === 0) {
       stats.nullSkipped += 1;
       continue;
+    }
+    let anyNonZero = false;
+    for (const total of byPanel.values()) {
+      if (total !== 0) {
+        anyNonZero = true;
+        break;
+      }
     }
     if (!anyNonZero) {
       stats.zeroSkipped += 1;
       continue;
     }
-    if (seen.has(strike)) {
-      // ON CONFLICT DO NOTHING would silently drop the second copy;
-      // count it so a duplicate-emitting payload is visible.
-      stats.duplicates += 1;
-      continue;
-    }
-    seen.add(strike);
     stats.kept += 1;
 
-    for (const [panel, net] of nets) {
-      const clamped = clampSnapshotValue(net);
-      if (clamped !== net) stats.clamped += 1;
+    // EOD_PANELS order, not accumulation order — deterministic output.
+    for (const panel of EOD_PANELS) {
+      const total = byPanel.get(panel);
+      if (total == null) continue;
+      const clamped = clampSnapshotValue(total);
+      if (clamped !== total) stats.clamped += 1;
       panels.push(panel);
       strikes.push(strike);
       values.push(clamped);

@@ -226,10 +226,6 @@
       "schedule": "0 12 * * *"
     },
     {
-      "path": "/api/cron/audit-gexbot-health",
-      "schedule": "30 22 * * 1-5"
-    },
-    {
       "path": "/api/cron/fetch-net-flow-history",
       "schedule": "25 21 * * 1-5"
     },
@@ -286,42 +282,6 @@
       "schedule": "* 13-21 * * 1-5"
     },
     {
-      "path": "/api/cron/fetch-gexbot-fast",
-      "schedule": "30-59 13 * * 1-5"
-    },
-    {
-      "path": "/api/cron/fetch-gexbot-fast",
-      "schedule": "* 14-20 * * 1-5"
-    },
-    {
-      "path": "/api/cron/fetch-gexbot-fast",
-      "schedule": "0-55 21 * * 1-5"
-    },
-    {
-      "path": "/api/cron/fetch-gexbot-strikes",
-      "schedule": "30-59 13 * * 1-5"
-    },
-    {
-      "path": "/api/cron/fetch-gexbot-strikes",
-      "schedule": "* 14-20 * * 1-5"
-    },
-    {
-      "path": "/api/cron/fetch-gexbot-strikes",
-      "schedule": "0-55 21 * * 1-5"
-    },
-    {
-      "path": "/api/cron/populate-periscope-from-gexbot",
-      "schedule": "30,40,50 13 * * 1-5"
-    },
-    {
-      "path": "/api/cron/populate-periscope-from-gexbot",
-      "schedule": "*/10 14-20 * * 1-5"
-    },
-    {
-      "path": "/api/cron/populate-periscope-from-gexbot",
-      "schedule": "*/10 21 * * 1-5"
-    },
-    {
       "path": "/api/cron/populate-periscope-from-uw",
       "schedule": "30,40,50 13 * * 1-5"
     },
@@ -344,14 +304,6 @@
     {
       "path": "/api/cron/periscope-playbook",
       "schedule": "*/10 21 * * 1-5"
-    },
-    {
-      "path": "/api/cron/archive-gexbot",
-      "schedule": "30 21 * * 2-6"
-    },
-    {
-      "path": "/api/cron/cleanup-gexbot",
-      "schedule": "15 12 * * 1-5"
     },
     {
       "path": "/api/cron/capture-opening-flow-signal",
@@ -380,7 +332,6 @@
     "api/cron/detect-silent-boom.ts": { "maxDuration": 60 },
     "api/cron/detect-periscope-call-lottery.ts": { "maxDuration": 30 },
     "api/cron/detect-periscope-put-lottery.ts": { "maxDuration": 30 },
-    "api/cron/populate-periscope-from-gexbot.ts": { "maxDuration": 30 },
     "api/cron/populate-periscope-from-uw.ts": { "maxDuration": 30 },
     "api/cron/periscope-playbook.ts": {
       "maxDuration": 780,
@@ -398,8 +349,6 @@
     "api/cron/capture-flow-regime-daily.ts": { "maxDuration": 300 },
     "api/cron/fetch-gex-strike-expiry-etfs.ts": { "maxDuration": 60 },
     "api/cron/rollup-ws-gex-strike-expiry.ts": { "maxDuration": 120 },
-    "api/cron/fetch-gexbot-strikes.ts": { "maxDuration": 60 },
-    "api/cron/archive-gexbot.ts": { "maxDuration": 300 },
     "api/cron/embed-yesterday.ts": { "maxDuration": 60 }
   },
   "installCommand": "npm install --loglevel=error --no-audit --no-fund",

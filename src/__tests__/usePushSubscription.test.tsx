@@ -404,3 +404,28 @@ describe('unsubscribe()', () => {
     expect(result.current.subscribed).toBe(false);
   });
 });
+
+describe('pending', () => {
+  it('is false once a subscribe settles, success or failure', async () => {
+    setNotificationPermission('granted');
+    mockServiceWorker({ existing: null });
+    mockFetch(false); // server rejects — the finally must still clear it
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(false));
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toMatch(/500/);
+  });
+
+  it('is false after a successful subscribe', async () => {
+    setNotificationPermission('granted');
+    mockServiceWorker({ existing: null });
+    mockFetch();
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(true));
+    expect(result.current.pending).toBe(false);
+  });
+});

@@ -340,3 +340,61 @@ describe('NotificationPermission: push repair rows', () => {
     expect(container.innerHTML).toBe('');
   });
 });
+
+describe('NotificationPermission: failure feedback', () => {
+  it('shows why the last registration failed', () => {
+    // Without this the row offers a button, the press fails inside the
+    // hook, and the user sees nothing move — which is exactly how the
+    // first version of this fix presented as "it won't let me click".
+    render(
+      <NotificationPermission
+        permission="granted"
+        pushSubscribed={false}
+        pushSupported
+        isOwner
+        pushError="Server rejected subscription: 403"
+        onRequest={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByTestId('notification-permission-error'),
+    ).toHaveTextContent('Server rejected subscription: 403');
+  });
+
+  it('says it is working and refuses a second press while in flight', async () => {
+    const onRequest = vi.fn().mockResolvedValue(undefined);
+    render(
+      <NotificationPermission
+        permission="granted"
+        pushSubscribed={false}
+        pushSupported
+        isOwner
+        pushPending
+        onRequest={onRequest}
+      />,
+    );
+
+    const button = screen.getByRole('button', { name: 'Working…' });
+    expect(button).toBeDisabled();
+    await userEvent.click(button);
+    expect(onRequest).not.toHaveBeenCalled();
+  });
+
+  it('carries no failure line when there is no failure', () => {
+    render(
+      <NotificationPermission
+        permission="granted"
+        pushSubscribed={false}
+        pushSupported
+        isOwner
+        onRequest={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByTestId('notification-permission-error'),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Register' })).toBeEnabled();
+  });
+});

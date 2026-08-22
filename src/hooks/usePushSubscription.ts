@@ -57,6 +57,14 @@ export interface PushSubscriptionState {
   unsubscribe: () => Promise<void>;
   /** Last error from a subscribe/unsubscribe call (display-only). */
   error: string | null;
+  /**
+   * True while a subscribe/unsubscribe is in flight. Worth surfacing:
+   * `navigator.serviceWorker.ready` can hang indefinitely if the worker
+   * never activates, and without this the button looks inert — the user
+   * clicks, nothing moves, and there is no way to tell "working" from
+   * "broken".
+   */
+  pending: boolean;
 }
 
 /**
@@ -148,12 +156,14 @@ function canRepairSilently(): boolean {
 export function usePushSubscription(): PushSubscriptionState {
   const [subscribed, setSubscribed] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
   const mountedRef = useRef(true);
   const repairedRef = useRef(false);
   const supported = hasPushSupport();
 
   const subscribe = useCallback(async () => {
     setError(null);
+    setPending(true);
     try {
       const vapidKey = import.meta.env.VITE_VAPID_PUBLIC_KEY;
       if (!vapidKey) {
@@ -190,6 +200,8 @@ export function usePushSubscription(): PushSubscriptionState {
       captureUnlessAuth(e, { tags: { context: 'push_subscription' } });
       const msg = e instanceof Error ? e.message : String(e);
       if (mountedRef.current) setError(msg);
+    } finally {
+      if (mountedRef.current) setPending(false);
     }
   }, []);
 
@@ -234,6 +246,7 @@ export function usePushSubscription(): PushSubscriptionState {
 
   const unsubscribe = useCallback(async () => {
     setError(null);
+    setPending(true);
     try {
       if (!hasPushSupport()) {
         if (mountedRef.current) setSubscribed(false);
@@ -253,8 +266,10 @@ export function usePushSubscription(): PushSubscriptionState {
       captureUnlessAuth(e, { tags: { context: 'push_subscription' } });
       const msg = e instanceof Error ? e.message : String(e);
       if (mountedRef.current) setError(msg);
+    } finally {
+      if (mountedRef.current) setPending(false);
     }
   }, []);
 
-  return { subscribed, supported, subscribe, unsubscribe, error };
+  return { subscribed, supported, subscribe, unsubscribe, error, pending };
 }

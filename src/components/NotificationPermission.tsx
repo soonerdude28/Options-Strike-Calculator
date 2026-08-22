@@ -23,6 +23,7 @@ import { useState } from 'react';
 import {
   NOTIFICATION_COPY,
   resolveVariant,
+  type VariantDisplay,
   type VariantInputs,
 } from './notification-variant';
 
@@ -39,7 +40,7 @@ function isDismissed(): boolean {
   }
 }
 
-interface NotificationPermissionProps extends VariantInputs {
+interface NotificationPermissionProps extends VariantInputs, VariantDisplay {
   onRequest: () => Promise<void>;
 }
 
@@ -48,6 +49,8 @@ export default function NotificationPermission({
   pushSubscribed = null,
   pushSupported = false,
   isOwner = false,
+  pushError = null,
+  pushPending = false,
   onRequest,
 }: Readonly<NotificationPermissionProps>) {
   const [dismissed, setDismissed] = useState(isDismissed);
@@ -76,13 +79,24 @@ export default function NotificationPermission({
       data-testid={`notification-permission-${variant}`}
       className="border-edge bg-surface mx-auto mt-2 flex max-w-2xl items-center gap-3 rounded-lg border p-2.5 px-4 font-sans text-xs"
     >
-      <span className="text-secondary flex-1">{copy.message}</span>
+      <span className="text-secondary flex-1">
+        {copy.message}
+        {pushError ? (
+          <span
+            className="text-tertiary block"
+            data-testid="notification-permission-error"
+          >
+            Last attempt failed: {pushError}
+          </span>
+        ) : null}
+      </span>
       {copy.action ? (
         <button
           onClick={onRequest}
-          className="bg-accent rounded px-3 py-1 font-semibold text-white transition-opacity hover:opacity-80"
+          disabled={pushPending}
+          className="bg-accent rounded px-3 py-1 font-semibold text-white transition-opacity hover:opacity-80 disabled:opacity-50"
         >
-          {copy.action}
+          {pushPending ? 'Working…' : copy.action}
         </button>
       ) : null}
       <button

@@ -26,6 +26,18 @@ export interface VariantInputs {
   isOwner?: boolean;
 }
 
+export interface VariantDisplay {
+  /**
+   * Last failure from `usePushSubscription`. Rendered because the whole
+   * point of the repair row is that a registration failed, and a row
+   * that offers a button while hiding why the last press did nothing is
+   * worse than no row at all.
+   */
+  pushError?: string | null;
+  /** True while a registration is in flight — the button says so. */
+  pushPending?: boolean;
+}
+
 /**
  * The row to render, or `null` for silence.
  *

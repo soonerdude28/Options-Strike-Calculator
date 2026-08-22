@@ -1497,6 +1497,8 @@ export default function StrikeCalculator() {
       permission={alertState.notificationPermission}
       pushSubscribed={pushSub.subscribed}
       pushSupported={pushSub.supported}
+      pushError={pushSub.error}
+      pushPending={pushSub.pending}
       isOwner={isOwner}
       onRequest={async () => {
         // Phase 3 path: bump Notification.permission so the

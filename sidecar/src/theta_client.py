@@ -164,7 +164,9 @@ class ThetaClient:
         """Return all known expirations for a root, sorted ascending."""
         body = self._get_json("/v2/list/expirations", {"root": root})
         raw = body.get("response", [])
-        return sorted({_parse_yyyymmdd(d) for d in raw})
+        # Skip unparseable entries (Theta's 0 sentinel) rather than losing
+        # the entire listing to one junk value.
+        return sorted({d for d in (_parse_yyyymmdd_opt(r) for r in raw) if d is not None})
 
     def list_strikes(self, root: str, expiration: date) -> list[Decimal]:
         """Return all listed strikes (in dollars) for a root + expiration."""
@@ -379,9 +381,30 @@ def _parse_body(raw: bytes) -> dict[str, Any]:
 
 
 def _parse_yyyymmdd(value: int | str) -> date:
-    """Parse Theta's integer YYYYMMDD date into datetime.date."""
-    # DTZ007: calendar date only — .date() discards the (irrelevant) time part.
-    return datetime.strptime(str(value), "%Y%m%d").date()  # noqa: DTZ007
+    """Parse Theta's integer YYYYMMDD date into datetime.date.
+
+    Raises ThetaClientError (not ValueError) on junk. Theta emits ``0`` as a
+    "no date" sentinel, and a bare ValueError escaped every caller: they all
+    handle ThetaClientError and nothing else, so one sentinel took down the
+    whole call. See OPTIONS-STRIKE-CALCULATOR-23 (112 events).
+    """
+    try:
+        # DTZ007: calendar date only — .date() drops the irrelevant time part.
+        return datetime.strptime(str(value), "%Y%m%d").date()  # noqa: DTZ007
+    except ValueError as exc:
+        raise ThetaClientError(f"Theta returned an unparseable date: {value!r}") from exc
+
+
+def _parse_yyyymmdd_opt(value: int | str) -> date | None:
+    """``_parse_yyyymmdd`` that returns None instead of raising.
+
+    For listing endpoints, where one junk entry must not cost the whole
+    root — the same degrade-don't-die rule as the 472=NO_DATA handling.
+    """
+    try:
+        return _parse_yyyymmdd(value)
+    except ThetaClientError:
+        return None
 
 
 def _et_epoch_ms(d: date, ms_of_day: int) -> int:

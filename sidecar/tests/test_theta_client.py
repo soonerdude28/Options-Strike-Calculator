@@ -130,6 +130,52 @@ def test_list_expirations_empty() -> None:
         assert client.list_expirations("DOESNOTEXIST") == []
 
 
+def test_list_expirations_skips_the_zero_sentinel() -> None:
+    """Theta emits 0 as a "no date" sentinel inside an otherwise valid list.
+
+    `datetime.strptime("0", "%Y%m%d")` raises ValueError, and because the
+    parse happened inside a set comprehension over the whole response, ONE
+    sentinel killed the entire root's expiration listing. That surfaced as
+    OPTIONS-STRIKE-CALCULATOR-23 ("time data '0' does not match format
+    '%Y%m%d'", 112 events) — an uncatchable ValueError escaping a client
+    whose callers only ever handle ThetaClientError.
+
+    Same philosophy as the 472=NO_DATA fix directly below: a junk entry
+    degrades to "skip that entry", never "lose the root".
+    """
+    payload = {
+        "header": {"format": ["date"]},
+        "response": [20260421, 0, 20260418],
+    }
+    with patch("theta_client.urlopen", return_value=_http_response(payload)):
+        client = ThetaClient()
+        out = client.list_expirations("SPXW")
+    assert out == [date(2026, 4, 18), date(2026, 4, 21)]
+
+
+def test_list_expirations_all_sentinels_is_an_empty_listing() -> None:
+    payload = {"header": {"format": ["date"]}, "response": [0, 0]}
+    with patch("theta_client.urlopen", return_value=_http_response(payload)):
+        client = ThetaClient()
+        assert client.list_expirations("SPXW") == []
+
+
+def test_parse_yyyymmdd_rejects_sentinel_as_a_domain_error() -> None:
+    """Non-listing call sites must raise ThetaClientError, not ValueError.
+
+    Callers (theta_fetcher's per-root isolation, the index routes) catch
+    ThetaClientError and degrade. A bare ValueError bypasses all of that.
+    """
+    from theta_client import _parse_yyyymmdd
+
+    with pytest.raises(ThetaClientError, match="date"):
+        _parse_yyyymmdd(0)
+    with pytest.raises(ThetaClientError, match="date"):
+        _parse_yyyymmdd("not-a-date")
+    # Valid input is untouched.
+    assert _parse_yyyymmdd(20260418) == date(2026, 4, 18)
+
+
 def test_list_expirations_472_no_data_returns_empty_list() -> None:
     # HTTP 472 = NO_DATA per the official Theta error-code docs, NOT an
     # entitlement denial. A 472 on the listing endpoint must read as an

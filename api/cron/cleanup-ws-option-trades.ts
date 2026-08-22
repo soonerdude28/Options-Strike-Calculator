@@ -34,6 +34,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 import { cronGuard } from '../_lib/api-helpers.js';
 import { getDb } from '../_lib/db.js';
+import { createWallBudget } from '../_lib/wall-budget.js';
 import logger from '../_lib/logger.js';
 import { Sentry } from '../_lib/sentry.js';
 
@@ -41,6 +42,14 @@ export const config = { maxDuration: 300 };
 
 const BATCH_SIZE = 50_000;
 const WALL_BUDGET_MS = 295_000;
+/**
+ * Worst-case cost of one batch — a 50k-row DELETE. The budget must refuse a
+ * batch it cannot finish: at `maxDuration: 300` a batch admitted at 294.9 s
+ * overran and Vercel killed the run, losing the response and its counts.
+ * Deliberately generous (the delete is unmeasured in production) and it
+ * rarely binds, since steady-state daily load drains in 2-3 min.
+ */
+const BATCH_RESERVE_MS = 30_000;
 const RETENTION_DAYS = 2;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -66,8 +75,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     'executed_at < ($1::date - ' +
     `INTERVAL '${RETENTION_DAYS} days') AT TIME ZONE 'America/New_York'`;
 
+  const budget = createWallBudget({
+    startMs: startedAt,
+    budgetMs: WALL_BUDGET_MS,
+    reserveMs: BATCH_RESERVE_MS,
+  });
+
   try {
     while (true) {
+      // Gate on "can a whole batch still finish", not "has the budget already
+      // elapsed" — the latter admits a batch with 0.1 s left. See
+      // api/_lib/wall-budget.ts.
+      if (!budget.canStartAnother()) {
+        stopReason = 'wall_budget';
+        break;
+      }
       const result = (await db.query(
         `WITH batch AS (
            SELECT id FROM ws_option_trades
@@ -85,10 +107,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       batches += 1;
 
       if (deleted === 0) break;
-      if (Date.now() - startedAt > WALL_BUDGET_MS) {
-        stopReason = 'wall_budget';
-        break;
-      }
     }
 
     const durationMs = Date.now() - startedAt;

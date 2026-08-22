@@ -140,6 +140,7 @@ vi.mock('../_lib/lottery-score-weights-v2.js', async (importOriginal) => {
 
 import handler, {
   DETECT_WALL_BUDGET_MS,
+  FIRE_RESERVE_MS,
 } from '../cron/detect-lottery-fires.js';
 
 const GUARD = { apiKey: '', today: '2026-05-01' };
@@ -1815,6 +1816,15 @@ describe('detect-lottery-fires handler', () => {
       advancePastBudget: () => {
         state.nowMs += DETECT_WALL_BUDGET_MS + 1;
       },
+      /**
+       * Advance into the reserve window: past the last instant a fire may
+       * safely START, but still INSIDE the budget. The old
+       * `Date.now() > deadline` check admitted a fire here and blew through
+       * maxDuration; the reserve is what refuses it.
+       */
+      advanceIntoReserveWindow: () => {
+        state.nowMs += DETECT_WALL_BUDGET_MS - FIRE_RESERVE_MS + 1;
+      },
       restore: () => spy.mockRestore(),
     };
   }
@@ -1941,6 +1951,49 @@ describe('detect-lottery-fires handler', () => {
         unevaluatedGroups: 0,
         unevaluatedFires: 1,
       });
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it('refuses a fire it cannot finish, while the budget itself still has time left', async () => {
+    // Regression guard for "Task timed out after 60 seconds". The multileg
+    // client's own timeout is 15s, so a fire admitted with 15s of budget
+    // left could not finish before maxDuration even in the best case for
+    // its other awaits. Here the clock sits INSIDE the budget but within
+    // one FIRE_RESERVE_MS of the deadline: the old check would have started
+    // fire 2, the reserve defers it instead.
+    const clock = fakeClock();
+    try {
+      mockFetchStockCandles1m.mockImplementationOnce(() => {
+        clock.advanceIntoReserveWindow();
+        return Promise.resolve([]);
+      });
+      mockTicks(manyFireableSndkStreams(2))
+        .mockResolvedValueOnce([]) // prior fires
+        .mockResolvedValueOnce([]) // ticker_flow_snapshot (Pass 1)
+        .mockResolvedValueOnce([]) // flow_data (fire 1)
+        .mockResolvedValueOnce([]) // spot_exposures (fire 1)
+        .mockResolvedValueOnce([{ id: 1 }]); // INSERT (fire 1)
+
+      const req = mockRequest({
+        method: 'GET',
+        headers: { authorization: 'Bearer test-secret' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(res._status).toBe(200);
+      expect(res._json).toMatchObject({
+        status: 'success',
+        truncated: true,
+        unevaluatedFires: 1,
+      });
+      // Fire 2 never ran its hot path — that is the whole point.
+      expect(mockClassifyAlertMultileg).toHaveBeenCalledTimes(1);
+      expect(
+        extractAllInsertBinds(mockSql, 'lottery_finder_fires'),
+      ).toHaveLength(1);
     } finally {
       clock.restore();
     }

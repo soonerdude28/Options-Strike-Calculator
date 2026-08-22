@@ -60,12 +60,35 @@ import {
 import { TAKEIT_GATE_EXEMPT_MIN_PROB } from '../_lib/takeit-score.js';
 import { withRetry } from '../_lib/uw-fetch.js';
 import { Sentry } from '../_lib/sentry.js';
+import { createWallBudget } from '../_lib/wall-budget.js';
 
 // 35-min scan window — needs at least baselineBuckets+1 buckets of
 // history (4+1 = 5 buckets = 25 min) plus 10 min slack for cron jitter
 // + late first ticks landing mid-bucket. Tight 30-min windows can drop
 // chains whose first trade arrives ≥6 min into the window.
 const SCAN_WINDOW_MIN = 35;
+
+/**
+ * Wall-clock budget for the Pass-2 fire loop. `vercel.json` gives this
+ * function `maxDuration: 60`; 45 s leaves 15 s for the response and the
+ * post-loop work. Mirrors DETECT_WALL_BUDGET_MS in detect-lottery-fires.
+ */
+export const SILENT_BOOM_WALL_BUDGET_MS = 45_000;
+
+/**
+ * Worst-case cost of ONE fire — the multileg classify call alone can take
+ * `DEFAULT_TIMEOUT_MS` (15 s), plus the gexbot / macro / INSERT work around
+ * it. This cron previously had NO budget at all and timed out in production
+ * on 2026-08-21; a budget without a reserve would not have saved it either,
+ * since the last admitted fire still runs its full cost on top. See
+ * api/_lib/wall-budget.ts.
+ *
+ * Deferring is safe here: the 35-min scan window at 5-min cadence re-scans
+ * the bucket, ON CONFLICT (option_chain_id, bucket_ct) DO NOTHING keeps the
+ * write idempotent, and cooldown is seeded from the DB — so a fire that was
+ * never INSERTed leaves no cooldown seed and is simply re-detected.
+ */
+export const SB_FIRE_RESERVE_MS = 20_000;
 
 // Cooldown lookback for the per-chain priorLastFireMs seed. Detector
 // cooldown is 60 min (12 buckets × 5min); we look back 70 min to
@@ -857,7 +880,22 @@ export default withCronInstrumentation(
       }
     }
 
+    const fireBudget = createWallBudget({
+      startMs: ctx.startTimeMs,
+      budgetMs: SILENT_BOOM_WALL_BUDGET_MS,
+      reserveMs: SB_FIRE_RESERVE_MS,
+    });
+    let firesEvaluated = 0;
+    let unevaluatedFires = 0;
+
     for (const { g, f, date, dte } of allFires) {
+      // Refuse a fire we cannot FINISH, not merely one starting after the
+      // budget elapsed — the multileg call alone can consume the remainder.
+      if (!fireBudget.canStartAnother()) {
+        unevaluatedFires = allFires.length - firesEvaluated;
+        break;
+      }
+      firesEvaluated += 1;
       // Score is deterministic from the fire payload + day context.
       // Computed inline so the row lands fully scored (no lazy
       // backfill / re-pass).
@@ -1165,6 +1203,21 @@ export default withCronInstrumentation(
     //     (observably degraded). A transient blip on a 0-fire tick had zero
     //     blast radius → stays 'success' (do NOT escalate).
     //   - else → 'success'.
+    if (unevaluatedFires > 0) {
+      // Graceful, expected degradation under load — warn, not Sentry. The
+      // deferred fires re-detect on the next 5-min run.
+      ctx.logger.warn(
+        {
+          unevaluatedFires,
+          firesEvaluated,
+          budgetMs: SILENT_BOOM_WALL_BUDGET_MS,
+          reserveMs: SB_FIRE_RESERVE_MS,
+          elapsedMs: fireBudget.elapsedMs(),
+        },
+        'detect-silent-boom: wall budget hit — deferring fires to the next run',
+      );
+    }
+
     const status: 'error' | 'partial' | 'success' =
       genuineFailures > 0
         ? 'error'
@@ -1175,6 +1228,8 @@ export default withCronInstrumentation(
       status,
       rows: inserted,
       metadata: {
+        truncated: unevaluatedFires > 0,
+        unevaluatedFires,
         bucketRows: bucketRows.length,
         chains: groups.size,
         skippedShort,

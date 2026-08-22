@@ -65,6 +65,7 @@ import {
   type FireTimeGexbotSnapshot,
 } from '../_lib/gexbot-queries.js';
 import { Sentry } from '../_lib/sentry.js';
+import { createWallBudget } from '../_lib/wall-budget.js';
 
 // 7-minute scan window — 5-min v4 window + 2-min slack so a slow cron
 // tick can't drop a trigger that landed at the start of its window.
@@ -103,6 +104,27 @@ const PRIOR_FIRE_LOOKBACK_MIN = 10;
  * index + ON CONFLICT DO NOTHING keep the write idempotent either way.
  */
 export const DETECT_WALL_BUDGET_MS = 45_000;
+
+/**
+ * Worst-case cost of ONE Pass-2 fire: macro + candles + multileg + gexbot +
+ * INSERT. The multileg client's own `DEFAULT_TIMEOUT_MS` is 15 s, so this is
+ * at least that plus its DB work.
+ *
+ * The budget alone provably cannot prevent the overrun: 45 s budget under a
+ * 60 s limit leaves exactly 15 s, which the classify call can consume on its
+ * own, leaving nothing for the fire's other awaits. That is the
+ * "Task timed out after 60 seconds" seen on 2026-08-19 and again 2026-08-21.
+ * A fire is now only STARTED when a full reserve still fits, so the last one
+ * begins by 25 s and finishes by 45 s worst case.
+ */
+export const FIRE_RESERVE_MS = 20_000;
+
+/**
+ * Worst-case cost of ONE Pass-1 chain group — a single
+ * `fetchTickerFlowSeries` call. Much cheaper than a fire, so it gets its own
+ * (smaller) reserve rather than being throttled by the fire figure.
+ */
+export const GROUP_RESERVE_MS = 5_000;
 
 // Cluster bonus constants — V2.2 Phase C.4
 // (spec: docs/tmp/v22-co-fire-analysis-2026-05-22.md).
@@ -234,8 +256,19 @@ export default withCronInstrumentation(
     // Wall-clock budget — see DETECT_WALL_BUDGET_MS. Anchored on the
     // wrapper's start stamp so the whole run (tick reads included) counts
     // against the budget, not just the loops below.
-    const deadlineMs = ctx.startTimeMs + DETECT_WALL_BUDGET_MS;
-    const pastDeadline = (): boolean => Date.now() > deadlineMs;
+    // Two views on the same budget: each loop refuses to START a unit it
+    // cannot finish, rather than only asking whether the budget has already
+    // elapsed. See api/_lib/wall-budget.ts for why the latter times out.
+    const groupBudget = createWallBudget({
+      startMs: ctx.startTimeMs,
+      budgetMs: DETECT_WALL_BUDGET_MS,
+      reserveMs: GROUP_RESERVE_MS,
+    });
+    const fireBudget = createWallBudget({
+      startMs: ctx.startTimeMs,
+      budgetMs: DETECT_WALL_BUDGET_MS,
+      reserveMs: FIRE_RESERVE_MS,
+    });
     let unevaluatedGroups = 0;
     let unevaluatedFires = 0;
 
@@ -544,7 +577,7 @@ export default withCronInstrumentation(
       // Wall-clock budget (DETECT_WALL_BUDGET_MS): stop evaluating chain
       // groups once it trips. The remainder rolls to the next minute's
       // run — the 7-min scan window re-detects the same trigger.
-      if (pastDeadline()) {
+      if (!groupBudget.canStartAnother()) {
         unevaluatedGroups = groups.size - groupsEvaluated;
         break;
       }
@@ -687,7 +720,7 @@ export default withCronInstrumentation(
       // that stacks up at the open. Once the budget trips, defer the
       // remaining fires — they were never INSERTed, so the next minute's
       // run re-detects them with no cooldown seed and writes them once.
-      if (pastDeadline()) {
+      if (!fireBudget.canStartAnother()) {
         unevaluatedFires = preparedFires.length - firesEvaluated;
         break;
       }

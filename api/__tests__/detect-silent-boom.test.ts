@@ -88,7 +88,10 @@ vi.mock('../_lib/api-helpers.js', () => ({
   cronGuard: mockCronGuard,
 }));
 
-import handler from '../cron/detect-silent-boom.js';
+import handler, {
+  SILENT_BOOM_WALL_BUDGET_MS,
+  SB_FIRE_RESERVE_MS,
+} from '../cron/detect-silent-boom.js';
 
 const GUARD = { apiKey: '', today: '2026-05-07' };
 
@@ -268,6 +271,55 @@ describe('detect-silent-boom handler', () => {
     });
     expect(mockSentryCaptureMessage).not.toHaveBeenCalled();
     vi.useRealTimers();
+  });
+
+  it('refuses a fire it cannot finish inside the wall budget', async () => {
+    // detect-silent-boom had NO wall budget at all while calling the
+    // multileg classifier (own timeout: 15s) per fire under maxDuration 60 —
+    // it timed out in production on 2026-08-21. It now defers fires it
+    // cannot finish; the 35-min scan window at 5-min cadence plus
+    // ON CONFLICT (option_chain_id, bucket_ct) DO NOTHING means a deferred
+    // fire is simply re-detected, never lost.
+    const START = 1_700_000_000_000;
+    let first = true;
+    const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      if (first) {
+        first = false;
+        return START; // ctx.startTimeMs at wrapper entry
+      }
+      // Inside the budget, but within one reserve of the deadline.
+      return START + SILENT_BOOM_WALL_BUDGET_MS - SB_FIRE_RESERVE_MS + 1;
+    });
+    try {
+      mockSql
+        .mockResolvedValueOnce(fireableSilentBoomStream())
+        .mockResolvedValueOnce([]) // prior fires
+        .mockResolvedValueOnce([]) // tide ticks
+        .mockResolvedValueOnce([]) // tide_otm ticks
+        .mockResolvedValueOnce([]) // zero_dte ticks
+        .mockResolvedValueOnce([]) // spx_gamma ticks
+        .mockResolvedValueOnce([{ ord: 1, cnt: 0 }]) // pre_trade_count
+        .mockResolvedValueOnce([]); // ticker_flow_snapshot
+
+      const req = mockRequest({
+        method: 'GET',
+        headers: { authorization: 'Bearer test-secret' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(res._status).toBe(200);
+      expect(res._json).toMatchObject({
+        status: 'success',
+        rows: 0,
+        totalFires: 1,
+        inserted: 0,
+        truncated: true,
+        unevaluatedFires: 1,
+      });
+    } finally {
+      dateNowSpy.mockRestore();
+    }
   });
 
   it('inserts an alert when the silent-boom pattern matches', async () => {

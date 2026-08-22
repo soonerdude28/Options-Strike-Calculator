@@ -165,10 +165,11 @@ describe('cleanup-ws-option-trades handler', () => {
     const startWall = 1_000_000;
     let call = 0;
     const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
-      // Sequence: handler entry (startedAt), then per-batch post-DELETE
-      // check. Push the second check past WALL_BUDGET_MS so the loop
-      // flips stopReason and exits.
-      const offsets = [0, 1_000, 300_000];
+      // Sequence: handler entry (startedAt), then one admission check per
+      // batch at the loop head. Two checks land inside the safe window
+      // (budget 295s - reserve 30s = 265s), the third past it, so the loop
+      // drains two batches then flips stopReason.
+      const offsets = [0, 1_000, 100_000, 270_000];
       const t = startWall + (offsets[call] ?? 400_000);
       call += 1;
       return t;
@@ -183,6 +184,42 @@ describe('cleanup-ws-option-trades handler', () => {
       stopReason: 'wall_budget',
     });
     expect(mockQuery).toHaveBeenCalledTimes(2);
+
+    dateNowSpy.mockRestore();
+  });
+
+  it('refuses to start a batch it cannot finish inside the budget', async () => {
+    // Regression guard for the 300s Vercel timeout. The budget is 295s and a
+    // batch is a 50k-row DELETE, so admitting one at 294.9s guaranteed an
+    // overrun. With a 30s reserve the last batch may start no later than
+    // 265s; at 270s elapsed the budget is NOT yet exhausted (the old
+    // `> WALL_BUDGET_MS` check would happily have run another batch) but a
+    // full batch no longer fits, so the loop must stop.
+    const fullBatch = Array.from({ length: 50_000 }, (_, i) => ({ id: i }));
+    mockQuery.mockResolvedValue(fullBatch);
+
+    const startWall = 1_000_000;
+    let call = 0;
+    const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      // [0] startedAt, [1] admit batch 1, [2] 270s — inside the budget but
+      // short of one reserve, so batch 2 must be refused.
+      // The fallback blows past the budget so a regressed implementation
+      // terminates and fails the assertion below instead of looping forever.
+      const offsets = [0, 1_000, 270_000];
+      const t = startWall + (offsets[call] ?? 400_000);
+      call += 1;
+      return t;
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(res._json).toMatchObject({
+      totalDeleted: 50_000,
+      batches: 1,
+      stopReason: 'wall_budget',
+    });
 
     dateNowSpy.mockRestore();
   });

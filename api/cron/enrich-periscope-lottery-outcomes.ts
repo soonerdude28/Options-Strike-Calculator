@@ -181,13 +181,20 @@ export default withCronInstrumentation(
       ).toISOString(),
     );
 
+    // Cast the unnest arrays to the COLUMN types, not the JS types:
+    // ws_option_trades.expiry is DATE and .strike is NUMERIC. Binding them
+    // as text[]/int[] made the JOIN compare `date = text`, an operator
+    // Postgres does not have, and this cron 500'd on every run
+    // (OPTIONS-STRIKE-CALCULATOR-46, 2026-08-21 21:50:02Z production).
+    // Note an UNCAST ${str} bind would have been fine — Postgres coerces an
+    // unknown-typed literal — so only the EXPLICIT text cast broke it.
     const tradeRows = (await withDbRetry(
       () => sql`
         SELECT u.id AS fire_id, t.executed_at, t.price::numeric AS price
           FROM unnest(
                  ${ids}::int[],
-                 ${expiries}::text[],
-                 ${strikes}::int[],
+                 ${expiries}::date[],
+                 ${strikes}::numeric[],
                  ${optionTypes}::text[],
                  ${fireTimes}::timestamptz[],
                  ${readEnds}::timestamptz[]

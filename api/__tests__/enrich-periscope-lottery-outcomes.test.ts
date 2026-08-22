@@ -109,6 +109,46 @@ describe('enrich-periscope-lottery-outcomes cron', () => {
     expect(params[6][0]).toBeCloseTo(-0.5, 2);
   });
 
+  it('binds the unnest arrays with casts that match the column types', async () => {
+    // Regression guard for OPTIONS-STRIKE-CALCULATOR-46,
+    // "NeonDbError: operator does not exist: date = text" — this cron 500'd
+    // on every run (observed 2026-08-21 21:50:02Z, production).
+    //
+    // ws_option_trades.expiry is DATE and .strike is NUMERIC. Binding the
+    // unnest columns as text[]/int[] made the JOIN compare `date = text`,
+    // which Postgres has no operator for. Note an UNCAST ${str} bind is
+    // fine — Postgres coerces an unknown-typed literal — so only an
+    // EXPLICIT text cast breaks it, which is why this survived review.
+    //
+    // Every other test here mocks `sql`, so none of them execute SQL; this
+    // asserts the query text itself, which is the only reachable guard
+    // without a live database.
+    const fire = {
+      id: 1,
+      fire_type: 'call_lottery',
+      fire_time: '2026-05-18T18:43:12Z',
+      expiry: '2026-05-18',
+      trade_strike: 7430,
+      entry_px: '0.10',
+    };
+    mockSql.mockResolvedValueOnce([fire]);
+    mockSql.mockResolvedValueOnce([]);
+    mockSql.mockResolvedValueOnce([]);
+
+    await handler(mockRequest({ method: 'GET' }), mockResponse());
+
+    // calls[1] = the batched LATERAL read. [0] is the template strings.
+    const readSql = (mockSql.mock.calls[1]?.[0] as unknown as string[]).join(
+      '?',
+    );
+    expect(readSql).toContain('::date[]');
+    expect(readSql).toContain('::numeric[]');
+    // The two casts that produced the type mismatch must not come back.
+    expect(readSql).not.toContain('::text[],\n                 ${');
+    const beforeUnnestEnd = readSql.slice(0, readSql.indexOf('AS u('));
+    expect(beforeUnnestEnd).not.toMatch(/\$\{?\}?::int\[\]/);
+  });
+
   it('uses 180m horizon for put_lottery (vs 120m for call)', async () => {
     const putFire = {
       id: 2,

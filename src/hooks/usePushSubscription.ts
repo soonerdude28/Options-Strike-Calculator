@@ -12,6 +12,18 @@
  *      c. POST the subscription JSON to `/api/push/subscribe`
  *   3. `unsubscribe()` reverses the steps and notifies the server.
  *
+ * Repair on mount: if the check in step 1 finds no subscription while
+ * `Notification.permission` is already `granted`, the owner is in a
+ * state the UI used to have no way out of — the "Enable notifications"
+ * banner only renders while permission is `default`, and it is the sole
+ * caller of `subscribe()`. So step 1 runs step 2 itself. Permission is
+ * already granted, so the browser shows no prompt; the effect is
+ * invisible and creates the subscription that should have existed.
+ * Owner-only, because `POST /api/push/subscribe` is owner-gated and a
+ * guest would earn a 401 for nothing.
+ *
+ * Spec: docs/superpowers/specs/push-subscription-repair-2026-08-22.md
+ *
  * `VITE_VAPID_PUBLIC_KEY` must be set in the build env for any of
  * this to work — when empty, `subscribe()` no-ops silently. That keeps
  * v2 dormant until the operator wires up VAPID keys on both
@@ -23,6 +35,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { captureUnlessAuth } from '../lib/sentry-helpers';
+import { checkIsOwner } from '../utils/auth';
 
 export interface PushSubscriptionState {
   /**
@@ -31,6 +44,13 @@ export interface PushSubscriptionState {
    * denied / Web Push unsupported.
    */
   subscribed: boolean | null;
+  /**
+   * Whether this browser can do Web Push at all. False in a browser
+   * without `PushManager` — notably iOS Safari, which exposes it only to
+   * a site installed on the Home Screen. Callers use it to offer the
+   * install hint instead of a button that cannot work.
+   */
+  supported: boolean;
   /** User-clickable trigger that does the full grant + subscribe flow. */
   subscribe: () => Promise<void>;
   /** Reverse the subscription, notify the server. */
@@ -108,29 +128,29 @@ async function postUnsubscribe(endpoint: string): Promise<void> {
   }
 }
 
+/**
+ * Whether a missing subscription should be repaired without being asked.
+ *
+ * Every clause is load-bearing: no VAPID key means v2 is dormant;
+ * a permission other than `granted` means repairing would put a prompt
+ * in front of someone who did not click anything; and a non-owner cannot
+ * POST to the owner-gated subscribe endpoint.
+ */
+function canRepairSilently(): boolean {
+  return (
+    Boolean(import.meta.env.VITE_VAPID_PUBLIC_KEY) &&
+    typeof Notification !== 'undefined' &&
+    Notification.permission === 'granted' &&
+    checkIsOwner()
+  );
+}
+
 export function usePushSubscription(): PushSubscriptionState {
   const [subscribed, setSubscribed] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    if (!hasPushSupport()) {
-      setSubscribed(false);
-      return;
-    }
-    navigator.serviceWorker.ready
-      .then(async (reg) => {
-        const sub = await reg.pushManager.getSubscription();
-        if (mountedRef.current) setSubscribed(sub != null);
-      })
-      .catch(() => {
-        if (mountedRef.current) setSubscribed(false);
-      });
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
+  const repairedRef = useRef(false);
+  const supported = hasPushSupport();
 
   const subscribe = useCallback(async () => {
     setError(null);
@@ -173,6 +193,45 @@ export function usePushSubscription(): PushSubscriptionState {
     }
   }, []);
 
+  // Declared after `subscribe` because it calls it. `subscribe` is a
+  // `useCallback` with no dependencies, so its identity is stable and
+  // this effect still runs exactly once per mount.
+  useEffect(() => {
+    mountedRef.current = true;
+    if (!hasPushSupport()) {
+      setSubscribed(false);
+      return;
+    }
+    navigator.serviceWorker.ready
+      .then(async (reg) => {
+        const sub = await reg.pushManager.getSubscription();
+        if (!mountedRef.current) return;
+        if (sub != null) {
+          setSubscribed(true);
+          return;
+        }
+        if (repairedRef.current || !canRepairSilently()) {
+          setSubscribed(false);
+          return;
+        }
+        // The repair. `subscribed` is deliberately left null until this
+        // resolves: flipping it to false first would flash the "push
+        // isn't registered" row on every load for a browser that is
+        // about to register one.
+        repairedRef.current = true; // StrictMode invokes effects twice
+        await subscribe();
+        // subscribe() sets true on success and leaves it alone on
+        // failure, so this only lands when the repair did not take.
+        if (mountedRef.current) setSubscribed((prev) => prev ?? false);
+      })
+      .catch(() => {
+        if (mountedRef.current) setSubscribed(false);
+      });
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [subscribe]);
+
   const unsubscribe = useCallback(async () => {
     setError(null);
     try {
@@ -197,5 +256,5 @@ export function usePushSubscription(): PushSubscriptionState {
     }
   }, []);
 
-  return { subscribed, subscribe, unsubscribe, error };
+  return { subscribed, supported, subscribe, unsubscribe, error };
 }

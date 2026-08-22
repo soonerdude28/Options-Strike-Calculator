@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import NotificationPermission from '../../components/NotificationPermission';
+import { resolveVariant } from '../../components/notification-variant';
 
 // ── Lifecycle ─────────────────────────────────────────────
 
@@ -183,5 +184,159 @@ describe('NotificationPermission: button presence', () => {
 
     expect(screen.getByRole('button', { name: 'Enable' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Not now' })).toBeInTheDocument();
+  });
+});
+
+// ============================================================
+// PUSH-SUBSCRIPTION VARIANTS
+// ============================================================
+//
+// The states added by the push-subscription repair. Before them this
+// component vanished the moment permission was answered, which left the
+// only caller of `subscribe()` unreachable and the owner with no way to
+// register a device.
+//
+// Spec: docs/superpowers/specs/push-subscription-repair-2026-08-22.md
+
+describe('resolveVariant', () => {
+  it("asks whenever permission is still 'default', owner or not", () => {
+    expect(resolveVariant({ permission: 'default' })).toBe('ask');
+    expect(resolveVariant({ permission: 'default', isOwner: true })).toBe(
+      'ask',
+    );
+  });
+
+  it('offers to repair a granted browser with no subscription', () => {
+    expect(
+      resolveVariant({
+        permission: 'granted',
+        pushSubscribed: false,
+        pushSupported: true,
+        isOwner: true,
+      }),
+    ).toBe('repair');
+  });
+
+  it('explains instead of offering when the browser cannot do push', () => {
+    // iOS Safari outside a Home Screen install: a Register button here
+    // could not work, so the row must not show one.
+    expect(
+      resolveVariant({
+        permission: 'granted',
+        pushSubscribed: false,
+        pushSupported: false,
+        isOwner: true,
+      }),
+    ).toBe('unsupported');
+  });
+
+  it('reports a browser-level block', () => {
+    expect(resolveVariant({ permission: 'denied', isOwner: true })).toBe(
+      'blocked',
+    );
+  });
+
+  it('says nothing while the subscription check is still in flight', () => {
+    // pushSubscribed === null. Rendering "push isn't registered" here
+    // would flash on every load of a perfectly healthy browser.
+    expect(
+      resolveVariant({
+        permission: 'granted',
+        pushSubscribed: null,
+        pushSupported: true,
+        isOwner: true,
+      }),
+    ).toBeNull();
+  });
+
+  it('says nothing when a subscription already exists', () => {
+    expect(
+      resolveVariant({
+        permission: 'granted',
+        pushSubscribed: true,
+        pushSupported: true,
+        isOwner: true,
+      }),
+    ).toBeNull();
+  });
+
+  it('shows a non-owner nothing beyond the initial ask', () => {
+    // /api/push/subscribe is owner-gated; a guest pressing Register
+    // would collect a 401 about something they never asked for.
+    for (const permission of ['granted', 'denied'] as const) {
+      expect(
+        resolveVariant({
+          permission,
+          pushSubscribed: false,
+          pushSupported: true,
+          isOwner: false,
+        }),
+      ).toBeNull();
+    }
+  });
+});
+
+describe('NotificationPermission: push repair rows', () => {
+  it('offers Register when push is granted but not subscribed', async () => {
+    const onRequest = vi.fn().mockResolvedValue(undefined);
+    render(
+      <NotificationPermission
+        permission="granted"
+        pushSubscribed={false}
+        pushSupported
+        isOwner
+        onRequest={onRequest}
+      />,
+    );
+
+    expect(
+      screen.getByTestId('notification-permission-repair'),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Register' }));
+    expect(onRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives the unsupported browser no button it cannot honour', () => {
+    render(
+      <NotificationPermission
+        permission="granted"
+        pushSubscribed={false}
+        pushSupported={false}
+        isOwner
+        onRequest={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/Home Screen/i)).toBeInTheDocument();
+    expect(screen.getAllByRole('button')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument();
+  });
+
+  it('tells a blocked owner where the fix lives', () => {
+    render(
+      <NotificationPermission
+        permission="denied"
+        isOwner
+        onRequest={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/blocked for this site/i)).toBeInTheDocument();
+    expect(screen.getAllByRole('button')).toHaveLength(1);
+  });
+
+  it('stays quiet for 24 hours after a dismissal, whatever the variant', () => {
+    localStorage.setItem('notif-prompt-dismissed', String(Date.now()));
+    const { container } = render(
+      <NotificationPermission
+        permission="granted"
+        pushSubscribed={false}
+        pushSupported
+        isOwner
+        onRequest={vi.fn()}
+      />,
+    );
+
+    expect(container.innerHTML).toBe('');
   });
 });

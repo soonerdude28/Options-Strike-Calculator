@@ -1,11 +1,30 @@
 /**
- * NotificationPermission — one-time prompt to enable browser notifications.
+ * NotificationPermission — the one place the app tells the owner that
+ * alerts cannot reach this browser, and offers the fix.
  *
- * Shows only for the site owner when Notification.permission === 'default'.
- * "Not now" suppresses the prompt for 24 hours via localStorage.
+ * It used to render only while `Notification.permission === 'default'`,
+ * which meant it disappeared the moment the question was answered — and
+ * since its Enable button is the only caller of `usePushSubscription`'s
+ * `subscribe()`, a browser that had granted permission before Web Push
+ * shipped could never register a subscription and nothing on the page
+ * said so. Four states now, so each dead end has a way out: `ask`,
+ * `repair`, `unsupported`, `blocked`. The rules and the copy live in
+ * `notification-variant.ts`.
+ *
+ * "Not now" / "Dismiss" suppresses the strip for 24 hours via
+ * localStorage — one key for every variant, so dismissing means "stop
+ * telling me about notifications today", not "stop telling me about
+ * this one thing".
+ *
+ * Spec: docs/superpowers/specs/push-subscription-repair-2026-08-22.md
  */
 
 import { useState } from 'react';
+import {
+  NOTIFICATION_COPY,
+  resolveVariant,
+  type VariantInputs,
+} from './notification-variant';
 
 const STORAGE_KEY = 'notif-prompt-dismissed';
 const DISMISS_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -20,18 +39,26 @@ function isDismissed(): boolean {
   }
 }
 
-interface NotificationPermissionProps {
-  permission: NotificationPermission | 'unsupported';
+interface NotificationPermissionProps extends VariantInputs {
   onRequest: () => Promise<void>;
 }
 
 export default function NotificationPermission({
   permission,
+  pushSubscribed = null,
+  pushSupported = false,
+  isOwner = false,
   onRequest,
 }: Readonly<NotificationPermissionProps>) {
   const [dismissed, setDismissed] = useState(isDismissed);
 
-  if (permission !== 'default' || dismissed) return null;
+  const variant = resolveVariant({
+    permission,
+    pushSubscribed,
+    pushSupported,
+    isOwner,
+  });
+  if (variant == null || dismissed) return null;
 
   const handleDismiss = () => {
     try {
@@ -42,22 +69,27 @@ export default function NotificationPermission({
     setDismissed(true);
   };
 
+  const copy = NOTIFICATION_COPY[variant];
+
   return (
-    <div className="border-edge bg-surface mx-auto mt-2 flex max-w-2xl items-center gap-3 rounded-lg border p-2.5 px-4 font-sans text-xs">
-      <span className="text-secondary flex-1">
-        Enable desktop notifications for real-time market alerts
-      </span>
-      <button
-        onClick={onRequest}
-        className="bg-accent rounded px-3 py-1 font-semibold text-white transition-opacity hover:opacity-80"
-      >
-        Enable
-      </button>
+    <div
+      data-testid={`notification-permission-${variant}`}
+      className="border-edge bg-surface mx-auto mt-2 flex max-w-2xl items-center gap-3 rounded-lg border p-2.5 px-4 font-sans text-xs"
+    >
+      <span className="text-secondary flex-1">{copy.message}</span>
+      {copy.action ? (
+        <button
+          onClick={onRequest}
+          className="bg-accent rounded px-3 py-1 font-semibold text-white transition-opacity hover:opacity-80"
+        >
+          {copy.action}
+        </button>
+      ) : null}
       <button
         onClick={handleDismiss}
         className="text-tertiary transition-opacity hover:opacity-80"
       >
-        Not now
+        {copy.dismiss}
       </button>
     </div>
   );

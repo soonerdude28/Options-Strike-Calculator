@@ -90,6 +90,8 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   delete (import.meta.env as Record<string, unknown>).VITE_VAPID_PUBLIC_KEY;
+  // The owner-gate test flips DEV; put it back so ordering cannot matter.
+  (import.meta.env as Record<string, unknown>).DEV = true;
 });
 
 describe('usePushSubscription mount check', () => {
@@ -119,6 +121,112 @@ describe('usePushSubscription mount check', () => {
     await waitFor(() => {
       expect(result.current.subscribed).toBe(false);
     });
+  });
+});
+
+describe('repair on mount', () => {
+  // The state the UI could not leave: permission granted (from the
+  // in-tab-notification era), no push subscription, and the only
+  // Enable button hidden because permission is no longer 'default'.
+  it('registers a subscription when permission is already granted', async () => {
+    setNotificationPermission('granted');
+    const { subscribe } = mockServiceWorker({ existing: null });
+    const fetchMock = mockFetch();
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(true));
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/push/subscribe',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(result.current.error).toBeNull();
+  });
+
+  it('does not repair when permission has not been granted', async () => {
+    setNotificationPermission('default');
+    const { subscribe } = mockServiceWorker({ existing: null });
+    const fetchMock = mockFetch();
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(false));
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not repair when a subscription already exists', async () => {
+    setNotificationPermission('granted');
+    const { subscribe } = mockServiceWorker({ existing: makeSubscription() });
+    const fetchMock = mockFetch();
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(true));
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not repair while VAPID is unconfigured', async () => {
+    import.meta.env.VITE_VAPID_PUBLIC_KEY = '';
+    setNotificationPermission('granted');
+    const { subscribe } = mockServiceWorker({ existing: null });
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(false));
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it('reports subscribed=false when the repair is rejected by the server', async () => {
+    setNotificationPermission('granted');
+    mockServiceWorker({ existing: null });
+    mockFetch(false);
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(false));
+    // The row that offers a manual retry keys off exactly this pair.
+    expect(result.current.error).toMatch(/500/);
+  });
+
+  it('does not repair for a visitor who is not the owner', async () => {
+    // POST /api/push/subscribe is guardOwnerEndpoint. A guest browser
+    // auto-subscribing would collect a 401 and show an error about
+    // something it never asked for. (DEV=false + no sc-hint cookie in
+    // jsdom is what checkIsOwner() reads as "not the owner".)
+    (import.meta.env as Record<string, unknown>).DEV = false;
+    setNotificationPermission('granted');
+    const { subscribe } = mockServiceWorker({ existing: null });
+    const fetchMock = mockFetch();
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(false));
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reports support so callers can offer the iOS install hint', async () => {
+    setNotificationPermission('granted');
+    mockServiceWorker({ existing: makeSubscription() });
+    const { result } = renderHook(() => usePushSubscription());
+    await waitFor(() => expect(result.current.subscribed).toBe(true));
+    expect(result.current.supported).toBe(true);
+  });
+
+  it('reports supported=false when the browser has no PushManager', async () => {
+    // iOS Safari outside a Home Screen install.
+    Reflect.deleteProperty(globalThis, 'PushManager');
+    setNotificationPermission('granted');
+    const { subscribe } = mockServiceWorker({ existing: null });
+
+    const { result } = renderHook(() => usePushSubscription());
+
+    await waitFor(() => expect(result.current.subscribed).toBe(false));
+    expect(result.current.supported).toBe(false);
+    expect(subscribe).not.toHaveBeenCalled();
   });
 });
 

@@ -1495,6 +1495,9 @@ export default function StrikeCalculator() {
   const notificationPrompt = market.hasData ? (
     <NotificationPermission
       permission={alertState.notificationPermission}
+      pushSubscribed={pushSub.subscribed}
+      pushSupported={pushSub.supported}
+      isOwner={isOwner}
       onRequest={async () => {
         // Phase 3 path: bump Notification.permission so the
         // in-tab notifications fire from the polling hooks.

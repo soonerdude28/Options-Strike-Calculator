@@ -460,7 +460,7 @@ All cron jobs are guarded by `CRON_SECRET` and run during market hours (13–21 
 | `compute-es-overnight`    | 9:35, 10:35 AM ET  | ES futures overnight session summary   |
 | `build-features`          | 4:45, 5:45 PM ET   | ML feature engineering (100+ features) |
 | `curate-lessons`          | Sat 3:00 AM UTC    | Weekly lessons curation pipeline       |
-| `backup-tables`           | Sun 5:00 AM UTC    | Database backup to Vercel Blob         |
+| `backup-tables`           | Sun 5:00 AM UTC    | DB backup to Blob (tape day-chunked)   |
 | `/api/health`             | Mon–Fri 9:25 AM ET | Postgres + Redis + Schwab token check  |
 
 ### ML Pipeline (Python)

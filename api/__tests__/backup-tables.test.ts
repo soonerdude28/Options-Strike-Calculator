@@ -49,6 +49,117 @@ import { reportCronRun } from '../_lib/axiom.js';
 
 // Fixed date: Sunday 5 AM UTC (typical cron run)
 const BACKUP_TIME = new Date('2026-03-29T05:00:00.000Z');
+const SNAPSHOT = '2026-03-29';
+
+/** Mirrors the module constants under test. */
+const SMALL_TABLE_COUNT = 15;
+const TAPE_PART_ROWS = 50_000;
+const WALL_BUDGET_MS = 265_000;
+const UNIT_RESERVE_MS = 60_000;
+/** `createWallBudget` admits a unit only at or before this instant. */
+const LAST_SAFE_START_MS = WALL_BUDGET_MS - UNIT_RESERVE_MS; // 205_000
+
+type Row = Record<string, unknown>;
+
+interface SqlRouter {
+  /** Rows for one `SELECT * FROM <small table> ... LIMIT/OFFSET` page. */
+  small?: (table: string, offset: number) => Row[];
+  /** Rows for the `GROUP BY date` trading-day census. */
+  days?: () => Row[];
+  /** Rows for one keyset page of `strike_exposures` for `date`. */
+  page?: (date: string, lastId: number) => Row[];
+}
+
+/**
+ * Route the tagged-template mock by the SQL text the handler builds.
+ * The census carries `GROUP BY`, a tape page carries the `id >` keyset
+ * predicate, and everything else is a small-table page.
+ */
+function installSql(router: SqlRouter): void {
+  mockSql.mockImplementation(
+    (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const text = Array.from(strings).join(' ');
+      if (text.includes('GROUP BY')) {
+        return Promise.resolve(router.days?.() ?? []);
+      }
+      if (text.includes('id >')) {
+        return Promise.resolve(
+          router.page?.(String(values[0]), Number(values[1])) ?? [],
+        );
+      }
+      return Promise.resolve(
+        router.small?.(String(values[0]), Number(values[2])) ?? [],
+      );
+    },
+  );
+}
+
+/** Every `put()` pathname, in call order. */
+function putPaths(): string[] {
+  return mockPut.mock.calls.map((c) => String(c[0]));
+}
+
+/** Row count of a JSONL Buffer body handed to `put()`. */
+function bodyRows(call: unknown[]): number {
+  return (call[1] as Buffer).toString('utf-8').split('\n').length;
+}
+
+/**
+ * Clock driver, mirroring the offsets idiom in
+ * `api/__tests__/cleanup-ws-option-trades.test.ts`.
+ *
+ * The handler calls `Date.now()` once for `startedAt` and once per
+ * `canStartAnother()` gate. Hard-coding that call index would break every
+ * time a table joins SMALL_TABLES, so the clock is driven off observable
+ * progress instead: it holds at t=0 until `afterPuts` uploads have landed,
+ * then jumps to `jumpTo` and stays there.
+ *
+ * `jumpTo` is chosen against the budget arithmetic, not by feel: 230_000
+ * sits in the gap between LAST_SAFE_START_MS (205_000) and WALL_BUDGET_MS
+ * (265_000). `exhausted()` is still false there — a pre-helper
+ * `elapsed > budget` check would happily admit another unit — while
+ * `canStartAnother()` refuses. That gap is exactly what these tests pin.
+ * The jump is permanent, so a regressed implementation that keeps looping
+ * still terminates and fails the count assertion instead of hanging.
+ */
+function driveClock(afterPuts: number, jumpTo = LAST_SAFE_START_MS + 25_000) {
+  const startWall = 1_000_000;
+  return vi.spyOn(Date, 'now').mockImplementation(() => {
+    const past = mockPut.mock.calls.length >= afterPuts;
+    return startWall + (past ? jumpTo : 0);
+  });
+}
+
+function authedReq() {
+  return mockRequest({
+    method: 'GET',
+    headers: { authorization: 'Bearer test-secret' },
+  });
+}
+
+interface TapeSummary {
+  strategy: string;
+  stopReason: string;
+  daysTotal: number;
+  daysExported: number;
+  daysAlreadyPresent: number;
+  daysIncomplete: number;
+  daysFailed: number;
+  rows: number;
+  bytes: number;
+  parts: number;
+  days: {
+    date: string;
+    rows: number;
+    bytes: number;
+    parts: number;
+    status: string;
+  }[];
+}
+
+function tapeOf(json: Record<string, unknown>): TapeSummary {
+  return json.strikeExposures as unknown as TapeSummary;
+}
 
 describe('backup-tables handler', () => {
   const originalEnv = process.env;
@@ -56,9 +167,9 @@ describe('backup-tables handler', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mockSql.unsafe = vi.fn((raw: string) => raw);
-    mockSql.mockResolvedValue([]);
+    installSql({});
     mockPut.mockResolvedValue({ url: 'https://blob.test/file' });
-    mockList.mockResolvedValue({ blobs: [] });
+    mockList.mockResolvedValue({ blobs: [], hasMore: false });
     mockDel.mockResolvedValue(undefined);
     process.env = { ...originalEnv };
     process.env.CRON_SECRET = 'test-secret';
@@ -68,6 +179,7 @@ describe('backup-tables handler', () => {
   afterEach(() => {
     process.env = originalEnv;
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   // ── Method guard ──────────────────────────────────────────
@@ -133,32 +245,24 @@ describe('backup-tables handler', () => {
     expect(res._status).not.toBe(401);
   });
 
-  // ── Happy path: successful backup ─────────────────────────
+  // ── Small tables: unchanged whole-table export ─────────────
 
-  it('exports all 16 tables and returns expected response shape', async () => {
-    const fakeRow = { id: 1, name: 'test' };
-    mockSql.mockResolvedValue([fakeRow]);
+  it('exports all 15 small tables in full and reports 16 table keys', async () => {
+    installSql({ small: () => [{ id: 1, name: 'test' }] });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(res._status).toBe(200);
-
     const json = res._json as Record<string, unknown>;
-    expect(json.date).toBe('2026-03-29');
-    expect(json.totalRows).toBe(16); // 1 row x 16 tables
-    expect(json.pruned).toBe(0);
+    expect(json.date).toBe(SNAPSHOT);
     expect(json.errors).toBeUndefined();
 
-    // All 16 tables should appear in results
     const tables = json.tables as Record<
       string,
       { rows: number; bytes: number }
     >;
+    // 15 small tables + the strike_exposures aggregate roll-up.
     expect(Object.keys(tables)).toHaveLength(16);
     expect(tables.market_snapshots).toEqual({
       rows: 1,
@@ -168,23 +272,19 @@ describe('backup-tables handler', () => {
       rows: 1,
       bytes: expect.any(Number),
     });
+    expect(tables.strike_exposures).toEqual({ rows: 0, bytes: 0 });
+    expect(json.totalRows).toBe(SMALL_TABLE_COUNT);
   });
 
-  it('calls sql tagged template with unsafe table name for each table', async () => {
-    mockSql.mockResolvedValue([]);
-
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
+  it('calls sql.unsafe once per small table and never for the tape table', async () => {
+    installSql({});
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
-    // 16 tables = 16 tagged-template calls + 16 unsafe interpolations
-    expect(mockSql).toHaveBeenCalledTimes(16);
-    expect(mockSql.unsafe).toHaveBeenCalledTimes(16);
+    expect(mockSql.unsafe).toHaveBeenCalledTimes(SMALL_TABLE_COUNT);
     expect(mockSql.unsafe).toHaveBeenCalledWith('market_snapshots');
     expect(mockSql.unsafe).toHaveBeenCalledWith('schema_migrations');
+    expect(mockSql.unsafe).not.toHaveBeenCalledWith('strike_exposures');
   });
 
   it('calls put() with correct path, options, and JSONL content', async () => {
@@ -192,18 +292,13 @@ describe('backup-tables handler', () => {
       { id: 1, value: 'alpha' },
       { id: 2, value: 'beta' },
     ];
-    mockSql.mockResolvedValue(rows);
+    installSql({ small: () => rows });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
-    // Check the first put call (market_snapshots)
     const firstCall = mockPut.mock.calls[0]!;
-    expect(firstCall[0]).toBe('backups/2026-03-29/market_snapshots.jsonl');
+    expect(firstCall[0]).toBe(`backups/${SNAPSHOT}/market_snapshots.jsonl`);
 
     // Body is a Buffer to dodge V8's ~512 MiB String.maxLength on large
     // tables (RangeError d758f914 fix). Decode for byte-exact comparison.
@@ -217,56 +312,35 @@ describe('backup-tables handler', () => {
       contentType: 'application/x-ndjson',
     });
 
-    // 16 put calls total
-    expect(mockPut).toHaveBeenCalledTimes(16);
+    expect(mockPut).toHaveBeenCalledTimes(SMALL_TABLE_COUNT);
   });
 
-  it('computes totalBytes correctly from JSONL content', async () => {
+  it('computes totalBytes from small-table JSONL plus tape parts', async () => {
     const row = { id: 1 };
-    mockSql.mockResolvedValue([row]);
+    installSql({ small: () => [row] });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     const json = res._json as Record<string, unknown>;
-    // .byteLength (not .length) matches the Buffer body produced by
-    // exportTable. ASCII JSON: byteLength === string length; the
-    // assertion stays stable across UTF-8 row payloads regardless.
     const expectedPerTable = Buffer.byteLength(JSON.stringify(row));
-    // 16 tables, each with one row
-    expect(json.totalBytes).toBe(expectedPerTable * 16);
+    expect(json.totalBytes).toBe(expectedPerTable * SMALL_TABLE_COUNT);
   });
 
-  // SENTRY-EMERALD-DESERT-6T: Vercel Blob's put() rejects empty bodies
-  // with "body is required". Empty tables are now skipped — recorded in
-  // the results map with rows:0/bytes:0 but never sent to Blob — so the
-  // weekly cron stops alerting on tables that simply happen to have no
-  // rows this week.
+  // SENTRY-EMERALD-DESERT-6T: Vercel Blob's put() rejects empty bodies.
   it('skips put() for empty tables but still records them in results', async () => {
-    mockSql.mockResolvedValue([]);
+    installSql({});
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
     expect(json.totalRows).toBe(0);
     expect(json.totalBytes).toBe(0);
     expect(json.errors).toBeUndefined();
-
-    // put() is NOT called when every table is empty.
     expect(mockPut).not.toHaveBeenCalled();
 
-    // All 16 tables still appear in results so a downstream consumer can
-    // tell "table absent because empty" vs "table missing because failed".
     const tables = json.tables as Record<
       string,
       { rows: number; bytes: number }
@@ -274,38 +348,28 @@ describe('backup-tables handler', () => {
     expect(Object.keys(tables)).toHaveLength(16);
     expect(tables.market_snapshots).toEqual({ rows: 0, bytes: 0 });
 
-    // Happy path with no errors → status 'ok'
     expect(reportCronRun).toHaveBeenCalledWith(
       'backup-tables',
       expect.objectContaining({ status: 'ok', errors: 0 }),
     );
   });
 
-  // SENTRY-EMERALD-DESERT-6V: Neon's serverless HTTP driver caps the
-  // response at 64 MiB. exportTable now pages via LIMIT/OFFSET so a
-  // single oversized table can't abort the whole backup row.
-  it('pages large tables via LIMIT/OFFSET chunks', async () => {
-    // Mock 50001 rows for `market_snapshots` (first table) — should
-    // require 2 chunks: [50000 rows] + [1 row]. All other tables stay
-    // small (1 row each) → 1 chunk.
-    const bigTable: Record<string, unknown>[] = Array.from(
-      { length: 50_000 },
-      (_, i) => ({ id: i }),
-    );
-    const tail: Record<string, unknown>[] = [{ id: 50_000 }];
-    const small: Record<string, unknown>[] = [{ id: 1 }];
+  // SENTRY-EMERALD-DESERT-6V: Neon's HTTP driver caps responses at 64 MiB.
+  it('pages large small tables via LIMIT/OFFSET chunks', async () => {
+    const bigTable: Row[] = Array.from({ length: TAPE_PART_ROWS }, (_, i) => ({
+      id: i,
+    }));
+    const tail: Row[] = [{ id: TAPE_PART_ROWS }];
 
-    mockSql
-      .mockResolvedValueOnce(bigTable) // market_snapshots chunk 1
-      .mockResolvedValueOnce(tail) // market_snapshots chunk 2
-      .mockResolvedValue(small); // every other table chunk 1
-
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
+    installSql({
+      small: (table, offset) => {
+        if (table !== 'market_snapshots') return [{ id: 1 }];
+        return offset === 0 ? bigTable : tail;
+      },
     });
+
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
@@ -313,57 +377,458 @@ describe('backup-tables handler', () => {
       string,
       { rows: number; bytes: number }
     >;
-    // market_snapshots collected both pages: 50000 + 1 = 50001 rows.
-    expect(tables.market_snapshots!.rows).toBe(50_001);
-    // Total = 50001 (market_snapshots) + 15 × 1 (every other table)
-    expect(json.totalRows).toBe(50_016);
-    // 17 sql calls total: 2 for market_snapshots + 1 for each of the
-    // remaining 15 tables.
-    expect(mockSql).toHaveBeenCalledTimes(17);
+    expect(tables.market_snapshots!.rows).toBe(TAPE_PART_ROWS + 1);
+    // 50_001 + 14 other small tables × 1 row each.
+    expect(json.totalRows).toBe(TAPE_PART_ROWS + 1 + (SMALL_TABLE_COUNT - 1));
   });
 
-  // ── Individual table failure ──────────────────────────────
+  // ── strike_exposures: per-trading-day parts ────────────────
 
-  it('continues when a single table export fails', async () => {
-    let callCount = 0;
-    mockSql.mockImplementation(async () => {
-      callCount++;
-      // Fail on the 3rd table (outcomes)
-      if (callCount === 3) {
-        throw new Error('relation "outcomes" does not exist');
-      }
-      return [{ id: 1 }];
+  it('resumes a truncated day from its uploaded parts, not from id 0', async () => {
+    // THE bug that made day-granular resume useless. The newest trading day
+    // is ~2.96M rows (~60 parts) and cannot finish inside one budget, so it
+    // never writes a _done marker. Restarting at lastId=0 re-walks the same
+    // parts on every run — forward progress is impossible and daysExported
+    // stays 0 forever, which is worse than the timeout this replaced.
+    //
+    // The cursor is recovered from the part FILENAME (part-NNNN-to-<endId>),
+    // so the blob listing already fetched for the marker check doubles as
+    // the cursor store: no extra request, no state table, no migration.
+    mockList.mockResolvedValue({
+      blobs: [
+        {
+          pathname: `backups/${SNAPSHOT}/strike_exposures/2026-03-27/part-0000-to-777.jsonl`,
+          url: 'u',
+        },
+      ],
+      hasMore: false,
+    });
+    const seenLastIds: number[] = [];
+    installSql({
+      days: () => [{ date: '2026-03-27', row_count: 2 }],
+      page: (date, lastId) => {
+        seenLastIds.push(lastId);
+        return lastId >= 778 ? [] : [{ id: 778, date, strike: 5000 }];
+      },
     });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    // Resumed at 777 — never re-read from 0.
+    expect(seenLastIds[0]).toBe(777);
+    expect(seenLastIds).not.toContain(0);
+    // And the next part is numbered 0001, not a duplicate 0000.
+    expect(putPaths()).toContain(
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/part-0001-to-778.jsonl`,
+    );
+  });
+
+  it('bounds every page by the day max id so the scan cannot run past the day', async () => {
+    // Without an upper bound the planner picks the pkey with a `date` filter
+    // and the LIMIT is never satisfied on a day's final page, so the scan
+    // runs to the end of the table: measured ~16.8M discarded row-visits
+    // against 4.16M exported, and 650ms vs 11ms on the oldest day's last
+    // page. The census supplies MIN/MAX(id) precisely to bound this.
+    const texts: string[] = [];
+    mockSql.mockImplementation(
+      (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const text = Array.from(strings).join(' ');
+        texts.push(text);
+        if (text.includes('GROUP BY')) {
+          return Promise.resolve([
+            { date: '2026-03-27', row_count: 1, min_id: 5, max_id: 9 },
+          ]);
+        }
+        if (text.includes('id >')) {
+          return Promise.resolve(
+            Number(values[1]) > 0 ? [] : [{ id: 9, date: '2026-03-27' }],
+          );
+        }
+        return Promise.resolve([]);
+      },
+    );
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    const census = texts.find((x) => x.includes('GROUP BY'));
+    expect(census).toMatch(/MIN\(id\)/);
+    expect(census).toMatch(/MAX\(id\)/);
+    // Smallest day first: a truncated run still completes whole small days
+    // instead of stalling forever inside the 60-part monolith.
+    expect(census).toMatch(/ORDER BY COUNT\(\*\) ASC/);
+    const page = texts.find((x) => x.includes('id >'));
+    expect(page).toMatch(/id <=/);
+  });
+
+  it('refuses to mark a day complete when the export is short of the census', async () => {
+    // Writing _done unconditionally means an empty first page — a dropped
+    // connection, a mid-run DELETE — stamps `rows: 0` as "complete", and
+    // resume then skips that day permanently. The snapshot would assert a
+    // day it does not contain. A backup that quietly lies is worse than one
+    // that fails loudly.
+    installSql({
+      days: () => [{ date: '2026-03-27', row_count: 5000 }],
+      page: () => [],
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    expect(putPaths()).not.toContain(
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/_done.jsonl`,
+    );
+    const tape = (res._json as Record<string, unknown>).strikeExposures as {
+      days: { status: string }[];
+      daysExported: number;
+      daysFailed: number;
+    };
+    expect(tape.days[0]!.status).toBe('failed');
+    expect(tape.daysExported).toBe(0);
+    expect(tape.daysFailed).toBe(1);
+  });
+
+  it('exports strike_exposures as per-trading-day parts with a _done marker', async () => {
+    installSql({
+      days: () => [
+        { date: '2026-03-27', row_count: 2 },
+        { date: '2026-03-26', row_count: 1 },
+      ],
+      page: (date, lastId) => {
+        if (lastId > 0) return [];
+        return date === '2026-03-27'
+          ? [
+              { id: 10, date, strike: 5000 },
+              { id: 11, date, strike: 5010 },
+            ]
+          : [{ id: 1, date, strike: 4900 }];
+      },
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    const tapePaths = putPaths().filter((p) => p.includes('strike_exposures'));
+    expect(tapePaths).toEqual([
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/part-0000-to-11.jsonl`,
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/_done.jsonl`,
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-26/part-0000-to-1.jsonl`,
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-26/_done.jsonl`,
+    ]);
+
+    const json = res._json as Record<string, unknown>;
+    const tape = tapeOf(json);
+    expect(tape.strategy).toBe('per-trading-day-parts');
+    expect(tape.stopReason).toBe('drained');
+    expect(tape.daysTotal).toBe(2);
+    expect(tape.daysExported).toBe(2);
+    expect(tape.daysIncomplete).toBe(0);
+    expect(tape.rows).toBe(3);
+    expect(tape.parts).toBe(2);
+    expect(tape.days.map((d) => d.status)).toEqual(['exported', 'exported']);
+
+    // The aggregate rolls up into the flat table map so totalRows stays honest.
+    const tables = json.tables as Record<
+      string,
+      { rows: number; bytes: number }
+    >;
+    expect(tables.strike_exposures!.rows).toBe(3);
+    expect(json.totalRows).toBe(3);
+  });
+
+  it('splits one trading day into bounded parts and advances by keyset id', async () => {
+    const first: Row[] = Array.from({ length: TAPE_PART_ROWS }, (_, i) => ({
+      id: i + 1,
+    }));
+    const second: Row[] = [{ id: TAPE_PART_ROWS + 1 }];
+    const seenCursors: number[] = [];
+
+    installSql({
+      days: () => [{ date: '2026-03-27', row_count: TAPE_PART_ROWS + 1 }],
+      page: (_date, lastId) => {
+        seenCursors.push(lastId);
+        if (lastId === 0) return first;
+        if (lastId === TAPE_PART_ROWS) return second;
+        return [];
+      },
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    // Keyset, not OFFSET: each cursor is the previous page's last id. A
+    // short page ends the walk, so no third round-trip is spent proving
+    // the day is drained.
+    expect(seenCursors).toEqual([0, TAPE_PART_ROWS]);
+
+    const tapeCalls = mockPut.mock.calls.filter((c) =>
+      String(c[0]).includes('/strike_exposures/'),
+    );
+    expect(tapeCalls.map((c) => String(c[0]))).toEqual([
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/part-0000-to-50000.jsonl`,
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/part-0001-to-50001.jsonl`,
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/_done.jsonl`,
+    ]);
+
+    // No single body may hold more than one page — this is the OOM guard.
+    expect(bodyRows(tapeCalls[0]!)).toBe(TAPE_PART_ROWS);
+    expect(bodyRows(tapeCalls[1]!)).toBe(1);
+
+    const tape = tapeOf(res._json as Record<string, unknown>);
+    expect(tape.rows).toBe(TAPE_PART_ROWS + 1);
+    expect(tape.parts).toBe(2);
+  });
+
+  it('never queries strike_exposures with OFFSET', async () => {
+    const texts: string[] = [];
+    mockSql.mockImplementation(
+      (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const text = Array.from(strings).join(' ');
+        texts.push(text);
+        if (text.includes('GROUP BY')) {
+          return Promise.resolve([{ date: '2026-03-27', row_count: 1 }]);
+        }
+        if (text.includes('id >')) {
+          return Promise.resolve(Number(values[1]) === 0 ? [{ id: 7 }] : []);
+        }
+        return Promise.resolve([]);
+      },
+    );
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    const tapeQueries = texts.filter((t) => t.includes('strike_exposures'));
+    expect(tapeQueries.length).toBeGreaterThan(0);
+    for (const q of tapeQueries) {
+      expect(q).not.toContain('OFFSET');
+    }
+  });
+
+  it('writes a _done marker recording the day summary', async () => {
+    installSql({
+      days: () => [{ date: '2026-03-27', row_count: 1 }],
+      page: (_d, lastId) => (lastId === 0 ? [{ id: 9 }] : []),
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    const done = mockPut.mock.calls.find((c) =>
+      String(c[0]).endsWith('_done.jsonl'),
+    )!;
+    expect(done[0]).toBe(
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/_done.jsonl`,
+    );
+    const marker = JSON.parse((done[1] as Buffer).toString('utf-8')) as Record<
+      string,
+      unknown
+    >;
+    expect(marker).toMatchObject({
+      table: 'strike_exposures',
+      date: '2026-03-27',
+      snapshot: SNAPSHOT,
+      rows: 1,
+      parts: 1,
+    });
+  });
+
+  it('resumes across runs: days already marked done are not re-exported', async () => {
+    mockList.mockImplementation(({ prefix }: { prefix: string }) => {
+      if (prefix === 'backups/') {
+        return Promise.resolve({ blobs: [], hasMore: false });
+      }
+      return Promise.resolve({
+        blobs: [
+          {
+            pathname: `backups/${SNAPSHOT}/strike_exposures/2026-03-27/_done.jsonl`,
+            url: 'https://blob.test/done',
+          },
+        ],
+        hasMore: false,
+      });
+    });
+
+    installSql({
+      days: () => [
+        { date: '2026-03-27', row_count: 4 },
+        { date: '2026-03-26', row_count: 1 },
+      ],
+      page: (date, lastId) =>
+        lastId === 0 && date === '2026-03-26' ? [{ id: 1 }] : [],
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    const tapePaths = putPaths().filter((p) =>
+      p.includes('/strike_exposures/'),
+    );
+    expect(tapePaths.every((p) => !p.includes('2026-03-27'))).toBe(true);
+
+    const tape = tapeOf(res._json as Record<string, unknown>);
+    expect(tape.daysAlreadyPresent).toBe(1);
+    expect(tape.daysExported).toBe(1);
+    const resumed = tape.days.find((d) => d.date === '2026-03-27')!;
+    expect(resumed.status).toBe('already_present');
+    // Row count comes from the census so the summary stays complete.
+    expect(resumed.rows).toBe(4);
+  });
+
+  // ── Wall budget ───────────────────────────────────────────
+
+  it('refuses a tape part it cannot finish and reports stopReason wall_budget', async () => {
+    // Every page is full, so the day never drains — only the budget can
+    // stop the loop.
+    const fullPage: Row[] = Array.from({ length: TAPE_PART_ROWS }, (_, i) => ({
+      id: i + 1,
+    }));
+    let cursor = 0;
+    installSql({
+      small: () => [{ id: 1 }],
+      days: () => [{ date: '2026-03-27', row_count: 10_000_000 }],
+      page: () => {
+        cursor += TAPE_PART_ROWS;
+        return fullPage.map((r) => ({ id: cursor + Number(r.id) }));
+      },
+    });
+
+    // 15 small-table uploads, then one tape part, then the clock jumps.
+    const clock = driveClock(SMALL_TABLE_COUNT + 1);
+    const res = mockResponse();
+    await handler(authedReq(), res);
+    clock.mockRestore();
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
+    expect(json.stopReason).toBe('wall_budget');
 
-    // 15 successful, 1 failed
+    const tape = tapeOf(json);
+    expect(tape.stopReason).toBe('wall_budget');
+    expect(tape.parts).toBe(1);
+    expect(tape.rows).toBe(TAPE_PART_ROWS);
+    expect(tape.days[0]!.status).toBe('wall_budget');
+
+    // Exactly one tape part uploaded — proves the refusal happened before
+    // the second page was ever awaited. No _done marker: the day is
+    // incomplete and must not look finished to a restore.
+    const tapePaths = putPaths().filter((p) =>
+      p.includes('/strike_exposures/'),
+    );
+    expect(tapePaths).toEqual([
+      `backups/${SNAPSHOT}/strike_exposures/2026-03-27/part-0000-to-100000.jsonl`,
+    ]);
+
+    expect(reportCronRun).toHaveBeenCalledWith(
+      'backup-tables',
+      expect.objectContaining({
+        status: 'partial',
+        stopReason: 'wall_budget',
+        complete: false,
+      }),
+    );
+  });
+
+  it('records every un-exported day so the gap is visible', async () => {
+    const fullPage: Row[] = Array.from({ length: TAPE_PART_ROWS }, (_, i) => ({
+      id: i + 1,
+    }));
+    let cursor = 0;
+    installSql({
+      small: () => [{ id: 1 }],
+      days: () => [
+        { date: '2026-03-27', row_count: 10_000_000 },
+        { date: '2026-03-26', row_count: 12 },
+        { date: '2026-03-25', row_count: 7 },
+      ],
+      page: () => {
+        cursor += TAPE_PART_ROWS;
+        return fullPage.map((r) => ({ id: cursor + Number(r.id) }));
+      },
+    });
+
+    const clock = driveClock(SMALL_TABLE_COUNT + 1);
+    const res = mockResponse();
+    await handler(authedReq(), res);
+    clock.mockRestore();
+
+    const tape = tapeOf(res._json as Record<string, unknown>);
+    expect(tape.daysTotal).toBe(3);
+    // The first day landed one part but never its _done marker, so it is
+    // incomplete too — all three days are unrestorable and say so.
+    expect(tape.daysExported).toBe(0);
+    expect(tape.daysIncomplete).toBe(3);
+    expect(tape.days.map((d) => `${d.date}:${d.status}`)).toEqual([
+      '2026-03-27:wall_budget',
+      '2026-03-26:wall_budget',
+      '2026-03-25:wall_budget',
+    ]);
+  });
+
+  it('keeps the small tables intact when the tape export is budget-starved', async () => {
+    const fullPage: Row[] = Array.from({ length: TAPE_PART_ROWS }, (_, i) => ({
+      id: i + 1,
+    }));
+    let cursor = 0;
+    installSql({
+      small: () => [{ id: 1 }],
+      days: () => [{ date: '2026-03-27', row_count: 10_000_000 }],
+      page: () => {
+        cursor += TAPE_PART_ROWS;
+        return fullPage.map((r) => ({ id: cursor + Number(r.id) }));
+      },
+    });
+
+    const clock = driveClock(SMALL_TABLE_COUNT + 1);
+    const res = mockResponse();
+    await handler(authedReq(), res);
+    clock.mockRestore();
+
+    const json = res._json as Record<string, unknown>;
+    const tables = json.tables as Record<string, { rows: number }>;
+    // All 15 small tables backed up in full despite the tape starving.
+    for (const key of Object.keys(tables)) {
+      if (key === 'strike_exposures') continue;
+      expect(tables[key]!.rows).toBe(1);
+    }
+    expect(json.stopReason).toBe('wall_budget');
+  });
+
+  // ── Failure isolation ─────────────────────────────────────
+
+  it('continues when a single small-table export fails', async () => {
+    installSql({
+      small: (table) => {
+        if (table === 'outcomes') {
+          throw new Error('relation "outcomes" does not exist');
+        }
+        return [{ id: 1 }];
+      },
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    const json = res._json as Record<string, unknown>;
     const tables = json.tables as Record<string, unknown>;
+    // 14 successful small tables + strike_exposures aggregate.
     expect(Object.keys(tables)).toHaveLength(15);
     expect(tables.outcomes).toBeUndefined();
 
-    // errors array should contain the failed table
     const errors = json.errors as string[];
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain('outcomes');
-    expect(errors[0]).toContain('relation "outcomes" does not exist');
 
-    // Sentry should capture the exception
     expect(Sentry.setTag).toHaveBeenCalledWith('cron.job', 'backup-tables');
     expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+    expect(mockPut).toHaveBeenCalledTimes(SMALL_TABLE_COUNT - 1);
 
-    // put() should only be called 15 times (not for the failed table)
-    expect(mockPut).toHaveBeenCalledTimes(15);
-
-    // Partial-failure → status 'partial' so the dashboard reflects reality
     expect(reportCronRun).toHaveBeenCalledWith(
       'backup-tables',
       expect.objectContaining({ status: 'partial', errors: 1 }),
@@ -371,56 +836,34 @@ describe('backup-tables handler', () => {
   });
 
   it('continues when put() fails for a table', async () => {
-    mockSql.mockResolvedValue([{ id: 1 }]);
+    installSql({ small: () => [{ id: 1 }] });
     let putCallCount = 0;
     mockPut.mockImplementation(async () => {
       putCallCount++;
-      if (putCallCount === 2) {
-        throw new Error('Blob upload failed');
-      }
+      if (putCallCount === 2) throw new Error('Blob upload failed');
       return { url: 'https://blob.test/file' };
     });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
-
-    // 15 successful tables, 1 failed
-    const tables = json.tables as Record<string, unknown>;
-    expect(Object.keys(tables)).toHaveLength(15);
-
     const errors = json.errors as string[];
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain('Blob upload failed');
-
-    expect(reportCronRun).toHaveBeenCalledWith(
-      'backup-tables',
-      expect.objectContaining({ status: 'partial', errors: 1 }),
-    );
   });
 
   it('handles non-Error throws in table export', async () => {
-    let callCount = 0;
-    mockSql.mockImplementation(async () => {
-      callCount++;
-      if (callCount === 1) {
-        throw 'string error'; // intentional: tests non-Error throw handling
-      }
-      return [];
+    installSql({
+      small: (table) => {
+        if (table === 'market_snapshots') throw 'string error';
+        return [];
+      },
     });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     const json = res._json as Record<string, unknown>;
     const errors = json.errors as string[];
@@ -428,97 +871,206 @@ describe('backup-tables handler', () => {
     expect(errors[0]).toContain('Unknown error');
   });
 
-  it('reports multiple table failures', async () => {
-    let callCount = 0;
-    mockSql.mockImplementation(async () => {
-      callCount++;
-      // Fail on 1st and 4th tables
-      if (callCount === 1 || callCount === 4) {
-        throw new Error(`Table ${callCount} failed`);
-      }
-      return [{ id: 1 }];
+  it('isolates a tape-day failure from the other days and the small tables', async () => {
+    installSql({
+      small: () => [{ id: 1 }],
+      days: () => [
+        { date: '2026-03-27', row_count: 1 },
+        { date: '2026-03-26', row_count: 1 },
+      ],
+      page: (date, lastId) => {
+        if (date === '2026-03-27') throw new Error('page read exploded');
+        return lastId === 0 ? [{ id: 1 }] : [];
+      },
     });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
     const errors = json.errors as string[];
-    expect(errors).toHaveLength(2);
-    expect(Sentry.captureException).toHaveBeenCalledTimes(2);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('strike_exposures 2026-03-27');
+    expect(errors[0]).toContain('page read exploded');
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+
+    const tape = tapeOf(json);
+    expect(tape.days.find((d) => d.date === '2026-03-27')!.status).toBe(
+      'failed',
+    );
+    expect(tape.days.find((d) => d.date === '2026-03-26')!.status).toBe(
+      'exported',
+    );
+    expect(tape.daysExported).toBe(1);
+    expect(tape.daysFailed).toBe(1);
+
+    // Small tables untouched by the tape failure.
+    const tables = json.tables as Record<string, { rows: number }>;
+    expect(tables.market_snapshots!.rows).toBe(1);
   });
 
-  // ── Pruning logic ────────────────────────────────────────
+  it('records a census failure without killing the small-table backup', async () => {
+    installSql({
+      small: () => [{ id: 1 }],
+      days: () => {
+        throw new Error('census failed');
+      },
+    });
 
-  it('prunes blobs older than 4 weeks', async () => {
-    // Current date is 2026-03-29, cutoff = 2026-03-01
-    mockList.mockResolvedValue({
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    const json = res._json as Record<string, unknown>;
+    const errors = json.errors as string[];
+    expect(errors.some((e) => e.includes('census failed'))).toBe(true);
+    const tables = json.tables as Record<string, { rows: number }>;
+    expect(tables.market_snapshots!.rows).toBe(1);
+  });
+
+  it('rejects a tape page whose last row has no numeric id', async () => {
+    installSql({
+      days: () => [{ date: '2026-03-27', row_count: 1 }],
+      page: () => [{ nope: true }],
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    const json = res._json as Record<string, unknown>;
+    const errors = json.errors as string[];
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('keyset cursor');
+  });
+
+  // ── Pruning ───────────────────────────────────────────────
+
+  it('prunes blobs older than 4 weeks, nested tape parts included', async () => {
+    mockList.mockImplementation(({ prefix }: { prefix: string }) => {
+      if (prefix !== 'backups/') {
+        return Promise.resolve({ blobs: [], hasMore: false });
+      }
+      return Promise.resolve({
+        blobs: [
+          {
+            pathname: 'backups/2026-02-15/market_snapshots.jsonl',
+            url: 'https://blob.test/old1',
+          },
+          {
+            pathname:
+              'backups/2026-02-28/strike_exposures/2026-02-27/part-0003.jsonl',
+            url: 'https://blob.test/old2',
+          },
+          {
+            pathname: 'backups/2026-03-22/analyses.jsonl',
+            url: 'https://blob.test/recent',
+          },
+        ],
+        hasMore: false,
+      });
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    expect(mockDel).toHaveBeenCalledWith([
+      'https://blob.test/old1',
+      'https://blob.test/old2',
+    ]);
+    const json = res._json as Record<string, unknown>;
+    expect(json.pruned).toBe(2);
+  });
+
+  it('paginates the prune listing so old blobs past page 1 are still seen', async () => {
+    const page1 = {
       blobs: [
-        {
-          pathname: 'backups/2026-02-15/market_snapshots.jsonl',
-          url: 'https://blob.test/old1',
-        },
-        {
-          pathname: 'backups/2026-02-28/analyses.jsonl',
-          url: 'https://blob.test/old2',
-        },
         {
           pathname: 'backups/2026-03-22/analyses.jsonl',
           url: 'https://blob.test/recent',
         },
       ],
-    });
+      cursor: 'cursor-1',
+      hasMore: true,
+    };
+    const page2 = {
+      blobs: [
+        {
+          pathname:
+            'backups/2026-01-04/strike_exposures/2026-01-02/part-0000.jsonl',
+          url: 'https://blob.test/ancient',
+        },
+      ],
+      hasMore: false,
+    };
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
+    mockList.mockImplementation(
+      ({ prefix, cursor }: { prefix: string; cursor?: string }) => {
+        if (prefix !== 'backups/') {
+          return Promise.resolve({ blobs: [], hasMore: false });
+        }
+        return Promise.resolve(cursor === 'cursor-1' ? page2 : page1);
+      },
+    );
+
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
-    expect(res._status).toBe(200);
-    expect(mockList).toHaveBeenCalledWith({ prefix: 'backups/' });
-
-    // Two old blobs should be deleted
-    expect(mockDel).toHaveBeenCalledWith([
-      'https://blob.test/old1',
-      'https://blob.test/old2',
-    ]);
-
+    expect(mockList).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'backups/', cursor: 'cursor-1' }),
+    );
+    expect(mockDel).toHaveBeenCalledWith(['https://blob.test/ancient']);
     const json = res._json as Record<string, unknown>;
-    expect(json.pruned).toBe(2);
+    expect(json.pruned).toBe(1);
+  });
+
+  it('batches the delete list so one prune cannot send thousands of URLs', async () => {
+    // A pruned snapshot now holds ~90 tape parts per trading day, so the
+    // URL list is no longer bounded by the table count.
+    const stale = Array.from({ length: 150 }, (_, i) => ({
+      pathname: `backups/2026-01-04/strike_exposures/2026-01-02/part-${String(i).padStart(4, '0')}.jsonl`,
+      url: `https://blob.test/stale-${i}`,
+    }));
+    mockList.mockImplementation(({ prefix }: { prefix: string }) => {
+      if (prefix !== 'backups/') {
+        return Promise.resolve({ blobs: [], hasMore: false });
+      }
+      return Promise.resolve({ blobs: stale, hasMore: false });
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(mockDel).toHaveBeenCalledTimes(2);
+    expect((mockDel.mock.calls[0]![0] as string[]).length).toBe(100);
+    expect((mockDel.mock.calls[1]![0] as string[]).length).toBe(50);
+    const json = res._json as Record<string, unknown>;
+    expect(json.pruned).toBe(150);
   });
 
   it('does not delete blobs within retention window', async () => {
-    // Current date is 2026-03-29, cutoff = 2026-03-01
-    mockList.mockResolvedValue({
-      blobs: [
-        {
-          pathname: 'backups/2026-03-08/analyses.jsonl',
-          url: 'https://blob.test/keep1',
-        },
-        {
-          pathname: 'backups/2026-03-15/analyses.jsonl',
-          url: 'https://blob.test/keep2',
-        },
-        {
-          pathname: 'backups/2026-03-22/analyses.jsonl',
-          url: 'https://blob.test/keep3',
-        },
-      ],
+    mockList.mockImplementation(({ prefix }: { prefix: string }) => {
+      if (prefix !== 'backups/') {
+        return Promise.resolve({ blobs: [], hasMore: false });
+      }
+      return Promise.resolve({
+        blobs: [
+          {
+            pathname: 'backups/2026-03-08/analyses.jsonl',
+            url: 'https://blob.test/keep1',
+          },
+          {
+            pathname: 'backups/2026-03-22/analyses.jsonl',
+            url: 'https://blob.test/keep3',
+          },
+        ],
+        hasMore: false,
+      });
     });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(mockDel).not.toHaveBeenCalled();
     const json = res._json as Record<string, unknown>;
@@ -526,25 +1078,27 @@ describe('backup-tables handler', () => {
   });
 
   it('skips blobs with non-matching pathname format', async () => {
-    mockList.mockResolvedValue({
-      blobs: [
-        {
-          pathname: 'backups/not-a-date/file.jsonl',
-          url: 'https://blob.test/weird',
-        },
-        {
-          pathname: 'other-prefix/2020-01-01/file.jsonl',
-          url: 'https://blob.test/other',
-        },
-      ],
+    mockList.mockImplementation(({ prefix }: { prefix: string }) => {
+      if (prefix !== 'backups/') {
+        return Promise.resolve({ blobs: [], hasMore: false });
+      }
+      return Promise.resolve({
+        blobs: [
+          {
+            pathname: 'backups/not-a-date/file.jsonl',
+            url: 'https://blob.test/weird',
+          },
+          {
+            pathname: 'other-prefix/2020-01-01/file.jsonl',
+            url: 'https://blob.test/other',
+          },
+        ],
+        hasMore: false,
+      });
     });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(mockDel).not.toHaveBeenCalled();
     const json = res._json as Record<string, unknown>;
@@ -553,27 +1107,17 @@ describe('backup-tables handler', () => {
 
   it('handles pruning failure without crashing the backup', async () => {
     mockList.mockRejectedValue(new Error('Blob list failed'));
+    installSql({ small: () => [{ id: 1 }] });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
-    // Pruning error appears in errors array
     const errors = json.errors as string[];
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain('pruning');
-    expect(errors[0]).toContain('Blob list failed');
-
-    // Sentry should capture the pruning error
+    expect(errors.some((e) => e.includes('pruning'))).toBe(true);
+    expect(errors.some((e) => e.includes('Blob list failed'))).toBe(true);
     expect(Sentry.setTag).toHaveBeenCalledWith('cron.job', 'backup-tables');
-    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
-
-    // Backup data should still be present
     expect(json.totalRows).toBeDefined();
     expect(json.pruned).toBe(0);
   });
@@ -581,52 +1125,34 @@ describe('backup-tables handler', () => {
   it('handles non-Error throws in pruning', async () => {
     mockList.mockRejectedValue('blob service down');
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     const json = res._json as Record<string, unknown>;
     const errors = json.errors as string[];
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain('pruning');
-    expect(errors[0]).toContain('Unknown');
+    expect(errors.some((e) => e.includes('pruning'))).toBe(true);
+    expect(errors.some((e) => e.includes('Unknown'))).toBe(true);
   });
 
-  // ── Date in backup path ───────────────────────────────────
+  // ── Response shape ────────────────────────────────────────
 
   it('uses the current date in the backup path', async () => {
     vi.setSystemTime(new Date('2026-12-25T05:00:00.000Z'));
-    mockSql.mockResolvedValue([{ id: 1 }]);
+    installSql({ small: () => [{ id: 1 }] });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     const json = res._json as Record<string, unknown>;
     expect(json.date).toBe('2026-12-25');
-
-    // Verify the path includes the correct date
-    const firstPutPath = mockPut.mock.calls[0]![0];
-    expect(firstPutPath).toMatch(/^backups\/2026-12-25\//);
+    expect(String(mockPut.mock.calls[0]![0])).toMatch(/^backups\/2026-12-25\//);
   });
 
-  // ── Response structure completeness ───────────────────────
-
   it('returns all required fields in the response', async () => {
-    mockSql.mockResolvedValue([{ id: 1 }]);
+    installSql({ small: () => [{ id: 1 }] });
 
-    const req = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
     const res = mockResponse();
-    await handler(req, res);
+    await handler(authedReq(), res);
 
     const json = res._json as Record<string, unknown>;
     expect(json).toHaveProperty('date');
@@ -634,31 +1160,50 @@ describe('backup-tables handler', () => {
     expect(json).toHaveProperty('totalRows');
     expect(json).toHaveProperty('totalBytes');
     expect(json).toHaveProperty('pruned');
-    // errors should be undefined when there are none
+    expect(json).toHaveProperty('stopReason');
+    expect(json).toHaveProperty('durationMs');
+    expect(json).toHaveProperty('strikeExposures');
     expect(json.errors).toBeUndefined();
+    expect(json.stopReason).toBe('drained');
   });
 
   it('includes errors field only when there are errors', async () => {
-    // Success case: no errors field
-    mockSql.mockResolvedValue([]);
-    const req1 = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
+    installSql({});
     const res1 = mockResponse();
-    await handler(req1, res1);
+    await handler(authedReq(), res1);
     expect((res1._json as Record<string, unknown>).errors).toBeUndefined();
 
-    // Error case: errors field present
     vi.resetAllMocks();
+    mockSql.unsafe = vi.fn((raw: string) => raw);
     mockSql.mockRejectedValue(new Error('DB down'));
-    mockList.mockResolvedValue({ blobs: [] });
-    const req2 = mockRequest({
-      method: 'GET',
-      headers: { authorization: 'Bearer test-secret' },
-    });
+    mockList.mockResolvedValue({ blobs: [], hasMore: false });
+    mockPut.mockResolvedValue({ url: 'https://blob.test/file' });
     const res2 = mockResponse();
-    await handler(req2, res2);
+    await handler(authedReq(), res2);
     expect((res2._json as Record<string, unknown>).errors).toBeDefined();
+  });
+
+  it('reports the tape strategy to Axiom on a clean run', async () => {
+    installSql({
+      days: () => [{ date: '2026-03-27', row_count: 1 }],
+      page: (_d, lastId) => (lastId === 0 ? [{ id: 3 }] : []),
+    });
+
+    const res = mockResponse();
+    await handler(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    expect(reportCronRun).toHaveBeenCalledWith(
+      'backup-tables',
+      expect.objectContaining({
+        status: 'ok',
+        stopReason: 'drained',
+        complete: true,
+        strikeExposureStrategy: 'per-trading-day-parts',
+        strikeExposureDays: 1,
+        strikeExposureRows: 1,
+        strikeExposureIncompleteDays: 0,
+      }),
+    );
   });
 });

@@ -395,20 +395,23 @@ def _fetch_eod_single_close(client: ThetaClient) -> list[EodRow]:
 
 
 # ---------------------------------------------------------------------------
-# FINDING D — throttle codes 429/476 are retried on the 5xx backoff path
+# FINDING D — transient codes (429 OS_LIMIT, 474 DISCONNECTED) retry on the
+# 5xx backoff path. 476 is WRONG_IP and PERMANENT — see test_theta_error_codes.
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_eod_476_then_200_succeeds_after_retry(
+def test_fetch_eod_474_then_200_succeeds_after_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 476 = Theta MDDS transient disconnect — retry, don't hard-fail.
+    # 474 = DISCONNECTED (connection lost to Theta MDDS) — transient, retry.
+    # This test previously used 476 and asserted it retried; 476 is WRONG_IP
+    # and permanent, so the old assertion encoded the bug.
     monkeypatch.setattr("theta_client.time.sleep", lambda _s: None)
     ok = {
         "header": {"format": ["close", "date"]},
         "response": [[1.23, 20240315]],
     }
-    side_effects = [_http_error(476, "MDDS disconnect"), _http_response(ok)]
+    side_effects = [_http_error(474, "MDDS disconnect"), _http_response(ok)]
     with patch("theta_client.urlopen", side_effect=side_effects):
         client = ThetaClient(max_retries=3)
         rows = _fetch_eod_single_close(client)
@@ -433,17 +436,17 @@ def test_fetch_eod_429_then_200_succeeds_after_retry(
     assert rows[0].close == Decimal("4.56")
 
 
-def test_fetch_eod_persistent_476_fails_after_max_retries(
+def test_fetch_eod_persistent_474_fails_after_max_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("theta_client.time.sleep", lambda _s: None)
     with patch(
-        "theta_client.urlopen", side_effect=_http_error(476, "MDDS disconnect")
+        "theta_client.urlopen", side_effect=_http_error(474, "MDDS disconnect")
     ) as mock_urlopen:
         client = ThetaClient(max_retries=2)
         with pytest.raises(ThetaClientError):
             _fetch_eod_single_close(client)
-    # 476 is retryable -> exhausts all attempts before raising.
+    # 474 is retryable -> exhausts all attempts before raising.
     assert mock_urlopen.call_count == 2
 
 

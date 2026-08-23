@@ -51,20 +51,51 @@ DEFAULT_BASE_URL = "http://127.0.0.1:25510"
 DEFAULT_TIMEOUT_S = 15
 DEFAULT_MAX_RETRIES = 3
 
-# Non-5xx HTTP codes that are transient and worth retrying on the same
-# backoff path as 5xx (FINDING D):
-#   429 — rate limit
-#   476 — Theta MDDS transient disconnect
-# 471 (PERMISSION) is intentionally excluded — it raises
-# ThetaSubscriptionError immediately so the fetcher can skip the root.
-# 472 (NO_DATA) is also excluded — it's coerced to the empty no-data
-# payload, exactly like the plain-text ":No data" body.
-_RETRYABLE_THROTTLE_CODES = frozenset({429, 476})
+# Retry classification, taken from Theta's published error-code table:
+# https://http-docs.thetadata.us/Articles/Data-And-Requests/Values/Error-Codes.html
+#
+#   429 OS_LIMIT        OS is throttling your requests            TRANSIENT
+#   470 GENERAL         A general error                          permanent
+#   471 PERMISSION      Account lacks required permissions       permanent
+#   472 NO_DATA         No data found for the request            permanent
+#   473 INVALID_PARAMS  Parameters / syntax invalid              permanent
+#   474 DISCONNECTED    Connection lost to Theta Data MDDS       TRANSIENT
+#   475 TERMINAL_PARSE  Issue parsing the request once received  permanent
+#   476 WRONG_IP        IP differs from the first request's IP   permanent
+#   477 NO_PAGE_FOUND   Page does not exist or expired           permanent
+#   570 LARGE_REQUEST   Request asking for too much data         permanent
+#   571 SERVER_STARTING Server intentionally restarting          TRANSIENT
+#   572 UNCAUGHT_ERROR  Contact support                          permanent
+#
+# This table previously had 474 and 476 REVERSED: 476 was retried under the
+# comment "Theta MDDS transient disconnect" (it is WRONG_IP, permanent) while
+# 474 — the actual transient disconnect — was not retried at all. A blanket
+# `500 <= code < 600` rule additionally retried 570 and 572, both permanent.
+# In the 2026-08-15..22 Sentry week, two paired /v2/hist/option/eod issues
+# accounted for 31.1k of 42.2k total errors (74%); retrying a permanent
+# failure three times triples both the event volume and the load on a
+# Terminal that is already refusing the request.
+#
+# 471 (PERMISSION) never reaches here — it raises ThetaSubscriptionError so
+# the fetcher can skip the root. 472 (NO_DATA) is coerced to the empty
+# no-data payload, exactly like the plain-text ":No data" body.
+_RETRYABLE_THETA_CODES = frozenset({429, 474, 571})
+
+# Theta codes in the 5xx range that are PERMANENT, so the generic 5xx rule
+# must not sweep them in.
+_PERMANENT_THETA_5XX = frozenset({570, 572})
 
 
 def _is_retryable_http(code: int) -> bool:
-    """Return True for HTTP codes that should retry with backoff (5xx + throttles)."""
-    return (500 <= code < 600) or (code in _RETRYABLE_THROTTLE_CODES)
+    """Return True for HTTP codes that should retry with backoff.
+
+    Theta's own codes are classified from its published table; anything else
+    in the 5xx range is an ordinary HTTP server error and stays retryable
+    (the Terminal is a local jar behind a normal HTTP stack).
+    """
+    if code in _PERMANENT_THETA_5XX:
+        return False
+    return (500 <= code < 600) or (code in _RETRYABLE_THETA_CODES)
 
 
 # Strikes are stored on the wire as integer thousandths of a dollar.

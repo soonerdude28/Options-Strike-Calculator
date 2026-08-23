@@ -14,9 +14,9 @@ src/              React 19 SPA (Tailwind CSS 4, no router)
   constants/      App-wide constants
 
 api/              Vercel Serverless Functions
-  _lib/           165+ shared modules (see "Backend Modules" below)
+  _lib/           173 shared modules (see "Backend Modules" below)
   auth/           Schwab OAuth flow (init.ts, callback.ts)
-  cron/           78 scheduled jobs (86 vercel.json cron entries; market data fetching, feature building, lesson curation, feed-freshness monitoring)
+  cron/           80 handlers, 75 of them scheduled (80 vercel.json cron entries; market data fetching, feature building, lesson curation, feed-freshness monitoring)
   journal/        Journal CRUD + DB init/migrate
   ml/             ML data export endpoint
 
@@ -167,10 +167,11 @@ Everything else gets the full loop.
 ### Backend (api/)
 
 - **Auth is single-owner + optional guest keys** — one Schwab OAuth session via httpOnly cookie. Plaintext cookie is intentional. The owner can hand out comma-separated guest keys via `GUEST_ACCESS_KEYS`; guests get read-only access to owner-gated data endpoints (dark pool, GEX, TRACE Live, etc.) but **not** to the Anthropic-backed `api/analyze.ts`. See `api/_lib/guest-auth.ts` (`rejectIfNotOwnerOrGuest`, `guardOwnerOrGuestEndpoint`) and `src/utils/auth.ts` (`getAccessMode`).
-- **Neon Postgres** — `@neondatabase/serverless`, lazy singleton via `getDb()`. 85+ tables managed by numbered migrations in `migrateDb()` (tracked in `schema_migrations`).
+- **Neon Postgres** — `@neondatabase/serverless`, lazy singleton via `getDb()`. 91 tables managed by numbered migrations in `migrateDb()` (tracked in `schema_migrations`).
 - **Upstash Redis** — stores Schwab OAuth tokens (access + refresh). Env vars: `KV_REST_API_URL` / `UPSTASH_REDIS_REST_URL`.
 - **Input validation** — Zod schemas under `api/_lib/validation/` (`common`, `snapshot`, `market-data`, `lottery`, `periscope`, `tracker`, …) validate at system boundaries before data reaches Anthropic or Postgres. `api/_lib/validation.ts` is now just a barrel that `export *`s those files — add new schemas to the matching sub-file, not the barrel.
-- **Cron jobs** — 86 cron entries in `vercel.json` (some paths have several schedules), all verify `CRON_SECRET`. Market data fetches run every 1–5 min during market hours (13-21 UTC, Mon-Fri).
+- **Cron jobs** — 80 cron entries in `vercel.json` (some paths have several schedules), all verify `CRON_SECRET`. Market data fetches run every 1–5 min during market hours (13-21 UTC, Mon-Fri).
+- **GEXBot feed is dead — its 5 cron handlers are intentionally unscheduled.** `archive-gexbot.ts`, `audit-gexbot-health.ts`, `cleanup-gexbot.ts`, `fetch-gexbot-fast.ts`, `fetch-gexbot-strikes.ts` and `populate-periscope-from-gexbot.ts` still exist on disk but have **no `vercel.json` entry** — do not re-add one, they only emit `GEXBOT_API_KEY is not configured`. Periscope is now fed by `populate-periscope-from-uw` instead, and `getZeroGammaFallbackAt()` in `api/_lib/gexbot-queries.ts` recovers `zero_gamma` + `spot` from the `zero_gamma_levels` table when `gexbot_snapshots` has no row (it never does any more).
 - **Bot protection** — `botid` checks on production endpoints, skipped in local dev. **When adding a new endpoint that calls `checkBot(req)`, also add its path to the `protect` array in `src/main.tsx`'s `initBotId()` call.**
 - **Logging** — `pino` logger in `api/_lib/logger.ts`.
 - **Sentry** — error tracking + metrics via `@sentry/node`.
@@ -180,7 +181,7 @@ Everything else gets the full loop.
 
 Key modules beyond the basics:
 
-- `db.ts` — `initDb()` (base tables) + `migrateDb()` (190 numbered migrations, stored in `api/_lib/db-migrations.ts`). New tables go in `migrateDb()` only, never `initDb()`.
+- `db.ts` — `initDb()` (base tables) + `migrateDb()` (192 numbered migrations, stored in `api/_lib/db-migrations.ts`). New tables go in `migrateDb()` only, never `initDb()`.
 - `db-analyses.ts`, `db-flow.ts`, `db-snapshots.ts`, `db-positions.ts`, `db-strike-helpers.ts` — query modules split from db.ts.
 - `analyze-prompts.ts` — static Anthropic prompt text (system prompt parts, rules, chart type descriptions).
 - `analyze-context.ts` — dynamic context assembly; calls formatters from `db-flow.ts` (e.g. `formatSpotExposuresForClaude()`).

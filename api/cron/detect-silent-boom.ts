@@ -69,11 +69,26 @@ import { createWallBudget } from '../_lib/wall-budget.js';
 const SCAN_WINDOW_MIN = 35;
 
 /**
- * Wall-clock budget for the Pass-2 fire loop. `vercel.json` gives this
- * function `maxDuration: 60`; 45 s leaves 15 s for the response and the
- * post-loop work. Mirrors DETECT_WALL_BUDGET_MS in detect-lottery-fires.
+ * Wall-clock budget for the Pass-2 fire loop.
+ *
+ * Sized from measured production runs. This cron's completion logs for the
+ * 2026-08-21 live session show total runtimes of 16.7s, 19.2s, 19.8s, 22.7s,
+ * 30.7s and 35.3s — and crucially, almost all of that is the PRE-loop bucket
+ * scan (130-146k bucket rows across ~52k chains), not the fire loop, which
+ * handles only 2-8 fires per run.
+ *
+ * That ordering is the trap. A 45s budget with SB_FIRE_RESERVE_MS=20s puts
+ * the admission cutoff at 25s, which on a 30-35s run elapses BEFORE the fire
+ * loop is even reached — so the loop would admit zero fires and silently
+ * write nothing, every run. The budget must therefore clear the scan with
+ * room to spare, not merely bound the loop.
+ *
+ * `vercel.json` gives this function `maxDuration: 120` (raised from 60; safe
+ * because the 5-min cadence means a long run cannot overlap the next one).
+ * 100s leaves 20s for the response, and the 80s admission cutoff sits far
+ * above the 35.3s worst case observed.
  */
-export const SILENT_BOOM_WALL_BUDGET_MS = 45_000;
+export const SILENT_BOOM_WALL_BUDGET_MS = 100_000;
 
 /**
  * Worst-case cost of ONE fire — the multileg classify call alone can take

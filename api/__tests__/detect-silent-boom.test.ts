@@ -1,5 +1,8 @@
 // @vitest-environment node
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mockRequest, mockResponse } from './helpers';
 import {
@@ -271,6 +274,33 @@ describe('detect-silent-boom handler', () => {
     });
     expect(mockSentryCaptureMessage).not.toHaveBeenCalled();
     vi.useRealTimers();
+  });
+
+  it('leaves the fire loop reachable — budget must clear the pre-loop scan', async () => {
+    // The trap this pins: the fire loop runs AFTER a heavy bucket scan
+    // (130-146k rows / ~52k chains on 2026-08-21), so the admission cutoff
+    // is not merely "how long may the loop run" — it must first survive
+    // everything before the loop.
+    //
+    // Measured total runtimes that day: 16.7 19.2 19.8 22.7 30.7 35.3 s.
+    // With a 45s budget and a 20s reserve the cutoff was 25s, which elapses
+    // before the loop is reached on a 30-35s run: the loop would admit ZERO
+    // fires and write nothing, silently, on every such run. Keep the cutoff
+    // well clear of that.
+    const cutoffMs = SILENT_BOOM_WALL_BUDGET_MS - SB_FIRE_RESERVE_MS;
+    const OBSERVED_WORST_RUN_MS = 35_300;
+    expect(cutoffMs).toBeGreaterThan(OBSERVED_WORST_RUN_MS * 2);
+
+    // …while still finishing inside maxDuration with room for the response.
+    const cfg = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'vercel.json'), 'utf8'),
+    ) as { functions?: Record<string, { maxDuration?: number }> };
+    const maxDuration =
+      cfg.functions?.['api/cron/detect-silent-boom.ts']?.maxDuration;
+    expect(maxDuration).toBeDefined();
+    expect(SILENT_BOOM_WALL_BUDGET_MS).toBeLessThanOrEqual(
+      maxDuration! * 1000 - 10_000,
+    );
   });
 
   it('refuses a fire it cannot finish inside the wall budget', async () => {

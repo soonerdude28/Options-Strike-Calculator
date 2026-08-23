@@ -329,7 +329,7 @@
     "api/cron/build-features.ts": { "maxDuration": 300 },
     "api/cron/backfill-futures-gaps.ts": { "maxDuration": 800 },
     "api/cron/detect-lottery-fires.ts": { "maxDuration": 60 },
-    "api/cron/detect-silent-boom.ts": { "maxDuration": 60 },
+    "api/cron/detect-silent-boom.ts": { "maxDuration": 120 },
     "api/cron/detect-periscope-call-lottery.ts": { "maxDuration": 30 },
     "api/cron/detect-periscope-put-lottery.ts": { "maxDuration": 30 },
     "api/cron/populate-periscope-from-uw.ts": { "maxDuration": 30 },

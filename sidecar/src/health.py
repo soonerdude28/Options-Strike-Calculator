@@ -459,6 +459,12 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+# Root probed by /admin/theta-entitlements. SPXW is the primary 0DTE
+# chain and the highest-volume root on the feed; entitlement is a property
+# of the subscription tier, not the ticker, so one root settles it.
+_PROBE_ROOT = "SPXW"
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     """Handle GET /health + POST /admin/seed-archive requests."""
 
@@ -527,6 +533,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     # the admin handler. Every entry gates itself on X-Admin-Token.
     _ADMIN_GET_ROUTES: tuple[tuple[str, str], ...] = (
         ("/admin/theta-backfill", "_handle_theta_backfill_status"),
+        ("/admin/theta-entitlements", "_handle_theta_entitlements"),
     )
 
     # All POST routes, exact-match. A table rather than an if-chain so a
@@ -803,6 +810,36 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._send_json(200, fetcher.targeted_backfill_status())
         except Exception as exc:  # noqa: BLE001 — never leave the request unanswered
             log.error("theta-backfill status failed: %s", exc)
+            self._send_json(500, {"error": str(exc)})
+
+    def _handle_theta_entitlements(self) -> None:
+        """GET /admin/theta-entitlements — does our Theta tier serve greeks + OI?
+
+        Read-only. Performs three GETs against the local Terminal and writes
+        nothing. Exists to settle, with evidence, whether the Options **Pro**
+        entitlement we already pay for covers
+        `/v2/bulk_snapshot/option/{all_greeks,greeks_second_order,open_interest}`
+        — the OI-weighted greek inputs GexBot's schema is derived from. If it
+        does, that schema is computable in-house and the $250/mo GexBot
+        Orderflow tier is unnecessary. See theta_entitlement_probe for the
+        status vocabulary (notably: 472 NO_DATA means ENTITLED-but-empty, and
+        must not be read as a denial).
+
+        Takes no query string — `_ADMIN_GET_ROUTES` dispatches on an EXACT
+        path match, so a `?root=` would simply 404. Probes SPXW, the primary
+        0DTE chain and the highest-volume root on the feed; entitlement is a
+        property of the tier, not of the ticker, so one root settles it.
+        """
+        if not self._theta_backfill_authorized("theta-entitlements"):
+            return
+
+        try:
+            from theta_client import ThetaClient  # noqa: PLC0415 — optional dep
+            from theta_entitlement_probe import probe_entitlements  # noqa: PLC0415
+
+            self._send_json(200, probe_entitlements(ThetaClient(), _PROBE_ROOT))
+        except Exception as exc:  # noqa: BLE001 — never leave the request unanswered
+            log.error("theta-entitlements probe failed: %s", exc)
             self._send_json(500, {"error": str(exc)})
 
     def _read_json_object_body(self) -> dict[str, Any] | None:

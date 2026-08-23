@@ -321,12 +321,78 @@ describe('gexbot-queries', () => {
 
   describe('getLatestGexbotSnapshotAt', () => {
     it('returns null when no row falls inside the freshness window', async () => {
-      mockSql.mockResolvedValueOnce([]);
+      // Two mocks: gexbot_snapshots, then the zero_gamma_levels fallback.
+      mockSql.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
       const result = await getLatestGexbotSnapshotAt(
         'SPY',
         new Date('2026-05-22T14:00:00Z'),
       );
       expect(result).toBeNull();
+    });
+
+    it('falls back to zero_gamma_levels when GexBot has no row', async () => {
+      // GexBot is a paid third party (api.gex.bot). GEXBOT_API_KEY has never
+      // been configured on this fork, so gexbot_snapshots holds 0 rows and
+      // every fire wrote NULL into all eight gex_ columns.
+      //
+      // `zero_gamma` and `spot` are independently derivable: compute-zero-gamma
+      // builds zero_gamma_levels from strike_exposures, which is UW-sourced and
+      // healthy (SPX/SPY/QQQ, ~80 rows each on 2026-08-21). Recovering those two
+      // is strictly better than NULL, and safe precisely because these columns
+      // have only ever been NULL here — there is no historical GexBot series to
+      // mix scales with.
+      //
+      // The five GexBot-proprietary flow metrics stay null: nothing outside
+      // GexBot computes cvroflow / dexoflow / gexoflow / net_put_dex / zcvr.
+      mockSql
+        .mockResolvedValueOnce([]) // gexbot_snapshots: empty
+        .mockResolvedValueOnce([
+          {
+            ts: new Date('2026-05-22T13:59:30Z'),
+            zero_gamma: '5820.5',
+            spot: '5834.25',
+          },
+        ]);
+
+      const result = await getLatestGexbotSnapshotAt(
+        'SPY',
+        new Date('2026-05-22T14:00:00Z'),
+      );
+
+      expect(result).not.toBeNull();
+      expect(result?.zeroGamma).toBe(5820.5);
+      expect(result?.spot).toBe(5834.25);
+      expect(result?.capturedAt.toISOString()).toBe('2026-05-22T13:59:30.000Z');
+      // Proprietary metrics remain unavailable — never fabricated.
+      expect(result?.oneCvroflow).toBeNull();
+      expect(result?.netPutDex).toBeNull();
+      expect(result?.oneDexoflow).toBeNull();
+      expect(result?.oneGexoflow).toBeNull();
+      expect(result?.zcvr).toBeNull();
+    });
+
+    it('prefers a real GexBot row over the fallback', async () => {
+      // If the key is ever configured, GexBot wins and the fallback is not
+      // even queried — one SQL call, not two.
+      mockSql.mockResolvedValueOnce([
+        {
+          captured_at: new Date('2026-05-22T13:59:00Z'),
+          one_cvroflow: '1.5',
+          net_put_dex: '2.5',
+          one_dexoflow: '3.5',
+          one_gexoflow: '4.5',
+          zcvr: '5.5',
+          zero_gamma: '6.5',
+          spot: '7.5',
+        },
+      ]);
+      const result = await getLatestGexbotSnapshotAt(
+        'SPY',
+        new Date('2026-05-22T14:00:00Z'),
+      );
+      expect(result?.oneCvroflow).toBe(1.5);
+      expect(result?.zeroGamma).toBe(6.5);
+      expect(mockSql).toHaveBeenCalledTimes(1);
     });
 
     it('returns the most recent row coerced to numbers', async () => {

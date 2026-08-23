@@ -422,6 +422,71 @@ interface RawFireTimeRow {
  * fetch-gexbot-fast runs at 1-min cadence — the prior 120s budget only
  * survived a single cron miss, which is real in practice).
  */
+/** `zero_gamma_levels` row shape backing the GexBot fallback. */
+interface ZeroGammaFallbackRow {
+  ts: Date | string;
+  zero_gamma: unknown;
+  spot: unknown;
+}
+
+/**
+ * Recover what we can when `gexbot_snapshots` has no row.
+ *
+ * GexBot is a paid third party (api.gex.bot/v2). `GEXBOT_API_KEY` has never
+ * been configured on this fork, so that table holds zero rows and every fire
+ * wrote NULL into all eight gex_ columns — 892 "GEXBOT_API_KEY is not
+ * configured" events in Sentry, and `gexHits: 0` on every detect run.
+ *
+ * Two of the eight are independently derivable: `compute-zero-gamma` builds
+ * `zero_gamma_levels` from `strike_exposures`, which is UW-sourced and healthy
+ * (SPX/SPY/QQQ, ~80 rows each on 2026-08-21 with zero_gamma and spot
+ * populated). Filling those two beats NULL.
+ *
+ * This is safe *because* the columns have only ever been NULL here: there is
+ * no historical GexBot series for a differently-derived zero_gamma to be mixed
+ * into, so none of the scale-mixing hazard that forces `source` tagging on
+ * periscope_snapshots applies. If GEXBOT_API_KEY is ever configured, the
+ * primary query wins and this is never reached.
+ *
+ * The five GexBot-proprietary flow metrics stay null — nothing outside GexBot
+ * computes cvroflow / dexoflow / gexoflow / net_put_dex / zcvr, and inventing
+ * them would be worse than leaving them absent. Coverage is limited to the
+ * three tickers compute-zero-gamma tracks.
+ */
+async function getZeroGammaFallbackAt(
+  ticker: string,
+  lowerBound: string,
+  upperBound: string,
+): Promise<FireTimeGexbotSnapshot | null> {
+  const sql = getDb();
+  const rows = (await withDbRetry(
+    () => sql`
+      SELECT ts, zero_gamma, spot
+      FROM zero_gamma_levels
+      WHERE ticker = ${ticker}
+        AND ts >= ${lowerBound}::timestamptz
+        AND ts <= ${upperBound}::timestamptz
+      ORDER BY ts DESC
+      LIMIT 1
+    `,
+    READ_RETRIES,
+    READ_TIMEOUT_MS,
+  )) as ZeroGammaFallbackRow[];
+
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    oneCvroflow: null,
+    netPutDex: null,
+    oneDexoflow: null,
+    oneGexoflow: null,
+    zcvr: null,
+    zeroGamma: toNum(row.zero_gamma),
+    spot: toNum(row.spot),
+    capturedAt: row.ts instanceof Date ? row.ts : new Date(row.ts),
+  };
+}
+
 export async function getLatestGexbotSnapshotAt(
   gexbotTicker: string,
   asOf: Date,
@@ -450,7 +515,9 @@ export async function getLatestGexbotSnapshotAt(
   )) as RawFireTimeRow[];
 
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {
+    return getZeroGammaFallbackAt(gexbotTicker, lowerBound, upperBound);
+  }
   return {
     oneCvroflow: toNum(row.one_cvroflow),
     netPutDex: toNum(row.net_put_dex),

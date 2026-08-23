@@ -1837,7 +1837,7 @@ describe('detect-lottery-fires handler', () => {
   }
 
   it('pins the wall budget under the Vercel maxDuration for this function', () => {
-    expect(DETECT_WALL_BUDGET_MS).toBe(45_000);
+    expect(DETECT_WALL_BUDGET_MS).toBe(50_000);
     const cfg = JSON.parse(
       readFileSync(resolve(process.cwd(), 'vercel.json'), 'utf8'),
     ) as { functions?: Record<string, { maxDuration?: number }> };

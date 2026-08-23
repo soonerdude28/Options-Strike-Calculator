@@ -86,9 +86,18 @@ const PRIOR_FIRE_LOOKBACK_MIN = 10;
 /**
  * Wall-clock budget for the per-group / per-fire work, in ms. vercel.json
  * gives this function `maxDuration: 60` and it runs every minute, so a
- * run must finish inside one cadence — 45s leaves headroom for the
- * in-flight fire's remaining awaits (macro / candles / multileg / gexbot
- * / INSERT) plus the post-loop feed-tier monitor query.
+ * run must finish inside one cadence — 50s leaves the 10s headroom the
+ * pinning test requires for the post-loop feed-tier monitor query and the
+ * response, while FIRE_RESERVE_MS covers the in-flight fire itself.
+ *
+ * Sized against measured production runs, not guesswork. On 2026-08-21
+ * (13:30-20:00Z live session) this cron's own completion logs show runs of
+ * 3.2s, 14.7s, 16.8s, 18.8s, 24.0s, 27.5s, 27.9s and 28.1s, every one of
+ * them reporting `truncated: false, unevaluatedFires: 0`. With a 45s budget
+ * the fire loop would have stopped admitting at 45-20=25s and truncated
+ * roughly a third of those runs — deferring fires that complete fine today.
+ * 50s puts the cutoff at 30s, above the observed 28.1s worst case, so normal
+ * runs finish whole and only genuinely pathological ones defer.
  *
  * Checked between Pass 1 chain groups and between Pass 2 fires, so an
  * overrun is bounded by one unit of work. When it trips the run returns a
@@ -103,19 +112,24 @@ const PRIOR_FIRE_LOOKBACK_MIN = 10;
  * actually INSERTed, and the (option_chain_id, trigger_time_ct) unique
  * index + ON CONFLICT DO NOTHING keep the write idempotent either way.
  */
-export const DETECT_WALL_BUDGET_MS = 45_000;
+export const DETECT_WALL_BUDGET_MS = 50_000;
 
 /**
  * Worst-case cost of ONE Pass-2 fire: macro + candles + multileg + gexbot +
  * INSERT. The multileg client's own `DEFAULT_TIMEOUT_MS` is 15 s, so this is
  * at least that plus its DB work.
  *
- * The budget alone provably cannot prevent the overrun: 45 s budget under a
- * 60 s limit leaves exactly 15 s, which the classify call can consume on its
- * own, leaving nothing for the fire's other awaits. That is the
- * "Task timed out after 60 seconds" seen on 2026-08-19 and again 2026-08-21.
- * A fire is now only STARTED when a full reserve still fits, so the last one
- * begins by 25 s and finishes by 45 s worst case.
+ * The budget alone provably cannot prevent the overrun: headroom equal to
+ * the classify timeout leaves nothing for the fire's other awaits. That is
+ * the "Task timed out after 60 seconds" seen on 2026-08-19 and again
+ * 2026-08-21. A fire is now only STARTED when a full reserve still fits, so
+ * the last one begins by 30 s (50 s budget - 20 s reserve) and finishes by
+ * 50 s worst case, leaving 10 s to the limit.
+ *
+ * 20 s is measured, not assumed: Friday's logs show classify calls normally
+ * returning in 100-1000 ms, but the 15 s DEFAULT_TIMEOUT_MS genuinely fires
+ * on the largest windows (observed 15,001 ms aborts on ~8-9k-trade TSLA
+ * chains), and the fire's remaining DB work adds a second or two on top.
  */
 export const FIRE_RESERVE_MS = 20_000;
 

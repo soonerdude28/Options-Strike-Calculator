@@ -30,12 +30,19 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { neon } from '@neondatabase/serverless';
 
-const DEFAULT_OUT = '/Users/ceverett/Trading-Bot/v1_ma_crossover/Data/signal_archive';
+const DEFAULT_OUT =
+  '/Users/ceverett/Trading-Bot/v1_ma_crossover/Data/signal_archive';
 
 /** table -> the column that carries its session date. */
 const TABLES: Record<string, string> = {
@@ -60,11 +67,15 @@ function arg(name: string, fallback: string): string {
 
 async function main(): Promise<number> {
   const out = arg('out', DEFAULT_OUT);
-  const tickers = arg('tickers', 'SPY,QQQ,SPX').split(',').map((t) => t.trim().toUpperCase());
+  const tickers = arg('tickers', 'SPY,QQQ,SPX')
+    .split(',')
+    .map((t) => t.trim().toUpperCase());
   const force = process.argv.includes('--force');
 
   if (!process.env.DATABASE_URL) {
-    console.error('DATABASE_URL is not set — run with: node --env-file=.env.local');
+    console.error(
+      'DATABASE_URL is not set — run with: node --env-file=.env.local',
+    );
     return 2;
   }
   const sql = neon(process.env.DATABASE_URL);
@@ -84,7 +95,9 @@ async function main(): Promise<number> {
       );
       dates = (r as { d: string }[]).map((x) => x.d).filter(Boolean);
     } catch (e) {
-      console.log(`${table.padEnd(22)} skipped — ${(e as Error).message.slice(0, 60)}`);
+      console.log(
+        `${table.padEnd(22)} skipped — ${(e as Error).message.slice(0, 60)}`,
+      );
       continue;
     }
     if (dates.length === 0) {
@@ -143,7 +156,10 @@ async function main(): Promise<number> {
   );
   console.log(`archive  ${out}`);
   if (existsSync(ledgerPath)) {
-    const lines = readFileSync(ledgerPath, 'utf8').trim().split('\n').filter(Boolean);
+    const lines = readFileSync(ledgerPath, 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean);
     console.log(`ledger   ${ledgerPath} (${lines.length} entries)`);
   }
   return 0;

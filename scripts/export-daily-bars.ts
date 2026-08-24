@@ -93,14 +93,20 @@ async function main(): Promise<number> {
 
   const startMs = Date.parse(`${start}T00:00:00-05:00`);
   const endMs = Date.parse(`${end}T23:59:59-05:00`);
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+  if (
+    !Number.isFinite(startMs) ||
+    !Number.isFinite(endMs) ||
+    endMs <= startMs
+  ) {
     console.error(`bad range: ${start} .. ${end}`);
     return 2;
   }
 
   const apiKey = process.env.UW_API_KEY ?? '';
   if (!apiKey) {
-    console.error('UW_API_KEY is not set — run with: node --env-file=.env.local');
+    console.error(
+      'UW_API_KEY is not set — run with: node --env-file=.env.local',
+    );
     return 2;
   }
 
@@ -110,7 +116,9 @@ async function main(): Promise<number> {
     end_date: end,
   });
 
-  console.log(`requesting  ${symbol} 1d candles, timeframe=${params.get('timeframe')}`);
+  console.log(
+    `requesting  ${symbol} 1d candles, timeframe=${params.get('timeframe')}`,
+  );
   const candles = await uwFetch<UwDailyCandle>(
     apiKey,
     `/stock/${encodeURIComponent(symbol)}/ohlc/1d?${params.toString()}`,
@@ -139,7 +147,8 @@ async function main(): Promise<number> {
   const rows = regular
     .map((c) => {
       // 1d candles carry `date`; fall back to the epoch path for safety.
-      const date = c.date ?? (c.start_time ? sessionDate(Date.parse(c.start_time)) : '');
+      const date =
+        c.date ?? (c.start_time ? sessionDate(Date.parse(c.start_time)) : '');
       return {
         date,
         open: num(c.open),
@@ -157,17 +166,22 @@ async function main(): Promise<number> {
     return 3;
   }
   const bad = rows.find(
-    (r) => !/^\d{4}-\d{2}-\d{2}$/.test(r.date) ||
+    (r) =>
+      !/^\d{4}-\d{2}-\d{2}$/.test(r.date) ||
       ![r.open, r.high, r.low, r.close, r.volume].every(Number.isFinite),
   );
   if (bad) {
-    console.error(`malformed candle: ${JSON.stringify(bad)}. Refusing to write.`);
+    console.error(
+      `malformed candle: ${JSON.stringify(bad)}. Refusing to write.`,
+    );
     return 4;
   }
 
   // Two independent signatures of a shifted series. The bot checks these too;
   // catching it here means we never write a bad file in the first place.
-  const weekendRows = rows.filter((r) => weekday(r.date) === 0 || weekday(r.date) === 6);
+  const weekendRows = rows.filter(
+    (r) => weekday(r.date) === 0 || weekday(r.date) === 6,
+  );
   if (weekendRows.length > 0) {
     console.error(
       `${weekendRows.length} bar(s) landed on a weekend (first ${weekendRows[0]!.date}). ` +
@@ -220,7 +234,7 @@ async function main(): Promise<number> {
     `rows: ${rows.length}`,
     'adjustment_provenance: >-',
     '  Source is Unusual Whales /stock/{ticker}/ohlc/1d, reached with this',
-    '  calculator\'s UW_API_KEY. NOT Schwab: this repo\'s schwabFetch(/pricehistory)',
+    "  calculator's UW_API_KEY. NOT Schwab: this repo's schwabFetch(/pricehistory)",
     '  rebuilds daily bars from UW minute data and caps at 66 sessions, so it',
     '  cannot serve a daily backtest. The split_only basis above is ASSUMED and',
     '  NOT verified - UW publishes no adjustment-basis field. Verify before any',
@@ -233,7 +247,9 @@ async function main(): Promise<number> {
   writeFileSync(out, `${csv}\n`, 'utf8');
   writeFileSync(out.replace(/\.csv$/, '.meta.yaml'), meta, 'utf8');
 
-  console.log(`received    ${rows.length} bars, ${rows[0]!.date} .. ${rows[rows.length - 1]!.date}`);
+  console.log(
+    `received    ${rows.length} bars, ${rows[0]!.date} .. ${rows[rows.length - 1]!.date}`,
+  );
   console.log(`wrote       ${out}`);
   console.log(`            ${out.replace(/\.csv$/, '.meta.yaml')}`);
   return 0;

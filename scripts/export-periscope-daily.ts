@@ -37,7 +37,9 @@ function arg(name: string, fallback: string): string {
 
 async function main(): Promise<number> {
   if (!process.env.DATABASE_URL) {
-    console.error('DATABASE_URL is not set — run with: node --env-file=.env.local');
+    console.error(
+      'DATABASE_URL is not set — run with: node --env-file=.env.local',
+    );
     return 2;
   }
   const out = resolve(arg('out', DEFAULT_OUT));
@@ -79,7 +81,9 @@ async function main(): Promise<number> {
   const data = rows as Row[];
 
   const bad = data.find(
-    (r) => !/^\d{4}-\d{2}-\d{2}$/.test(r.date) || !Number.isFinite(r.net_gamma ?? NaN),
+    (r) =>
+      !/^\d{4}-\d{2}-\d{2}$/.test(r.date) ||
+      !Number.isFinite(r.net_gamma ?? NaN),
   );
   if (bad) {
     console.error(`malformed row: ${JSON.stringify(bad)}. Refusing to write.`);
@@ -124,8 +128,12 @@ async function main(): Promise<number> {
   writeFileSync(out.replace(/\.csv$/, '.meta.yaml'), meta, 'utf8');
 
   const positive = data.filter((r) => (r.net_gamma ?? 0) > 0).length;
-  console.log(`sessions    ${data.length}, ${data[0]!.date} .. ${data[data.length - 1]!.date}`);
-  console.log(`net gamma   ${positive} positive / ${data.length - positive} negative`);
+  console.log(
+    `sessions    ${data.length}, ${data[0]!.date} .. ${data[data.length - 1]!.date}`,
+  );
+  console.log(
+    `net gamma   ${positive} positive / ${data.length - positive} negative`,
+  );
   console.log(`wrote       ${out}`);
   console.log(`            ${out.replace(/\.csv$/, '.meta.yaml')}`);
   return 0;

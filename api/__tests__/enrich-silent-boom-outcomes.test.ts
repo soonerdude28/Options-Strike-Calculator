@@ -294,4 +294,45 @@ describe('enrich-silent-boom-outcomes', () => {
     // minToPeak array element 0: the 10.50 tick is 2 min after the 14:30 entry.
     expect(minToPeak![0]).toBeCloseTo(2, 5);
   });
+
+  it('joins ticks when the driver hands back a STRING alert id and unnest a NUMBER', async () => {
+    // PRODUCTION TYPES — verified against the live database:
+    //   silent_boom_alerts.id          -> "1"  (string; BIGINT via the
+    //                                     Neon serverless driver)
+    //   unnest(${ids}::int[]) AS alertId -> 1  (number; int4)
+    // A JS Map does not coerce, so `ticksByAlert.get(alert.id)` missed EVERY
+    // entry and all 634 alerts were stamped terminal-no-tick with
+    // peak_ceiling_pct NULL — while the underlying query was returning
+    // 142,633 tick rows covering 206/206 of one day's alerts.
+    //
+    // This is the SAME defect fixed for the lottery cron in 7e262c82 (600
+    // fires written off on 2026-08-17); that fix was never carried across.
+    // Every other test in this file mocks BOTH sides as numbers, which is
+    // exactly why the batched refactor shipped green. Mirror production.
+    const stringIdAlert = { ...baseAlert, id: '1' as unknown as number };
+    mockSql.mockResolvedValueOnce([stringIdAlert]); // SELECT alerts
+    mockSql.mockResolvedValueOnce([
+      { alertId: 1, executedAt: new Date('2026-05-13T14:31:00Z'), price: 1.2 },
+      { alertId: 1, executedAt: new Date('2026-05-13T14:32:00Z'), price: 1.5 },
+    ]); // batched tick read — numeric alertId, as unnest ::int[] yields
+    mockSql.mockResolvedValueOnce([]); // enriched UPDATE
+
+    const req = mockRequest({
+      method: 'GET',
+      headers: { authorization: 'Bearer test-secret' },
+    });
+    const res = mockResponse();
+
+    await handler(req, res);
+
+    expect(res._status).toBe(200);
+    expect(res._json).toMatchObject({
+      status: 'success',
+      message: expect.stringContaining('Enriched 1 fires'),
+    });
+    // The whole point: it must NOT fall to the no-tick terminal stamp.
+    expect((res._json as { message: string }).message).not.toContain(
+      'skipped 1',
+    );
+  });
 });

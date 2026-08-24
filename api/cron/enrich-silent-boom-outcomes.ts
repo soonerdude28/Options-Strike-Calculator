@@ -43,7 +43,10 @@ import {
 } from '../_lib/lottery-exit-policies.js';
 
 interface UnenrichedAlert {
-  id: number;
+  /** BIGINT — the Neon serverless driver hands this back as a STRING at
+   *  runtime. Declaring it `number` is what let the Map-key split below
+   *  typecheck cleanly while missing every lookup. Keep it honest. */
+  id: number | string;
   optionChainId: string;
   bucketCt: Date;
   entryPrice: number;
@@ -171,18 +174,33 @@ export default withCronInstrumentation(
 
     // Bucket ticks per alert. Rows arrive ordered by (alert id, executed_at),
     // so each alert's ticks are already contiguous and ascending.
+    //
+    // Number() on BOTH sides is load-bearing. The two ids arrive as
+    // DIFFERENT JS types:
+    //   silent_boom_alerts.id            -> "1" (string; BIGINT via the Neon
+    //                                       serverless driver)
+    //   unnest(${ids}::int[]) AS alertId -> 1   (number; int4)
+    // A JS Map does not coerce, so an un-normalised get() misses EVERY entry
+    // and every alert falls to the no-tick terminal stamp below. That shipped:
+    // 634/634 alerts were written off with peak_ceiling_pct NULL while the
+    // query itself was returning 142,633 tick rows. Same defect the lottery
+    // cron hit (600 fires, fixed in 2826ee4a) — do not drop these casts; the
+    // mixed-type case is pinned by a test.
     const ticksByAlert = new Map<number, TradeTick[]>();
     for (const row of tickRows) {
-      const bucket = ticksByAlert.get(row.alertId);
+      const key = Number(row.alertId);
+      const bucket = ticksByAlert.get(key);
       if (bucket) bucket.push(row);
-      else ticksByAlert.set(row.alertId, [row]);
+      else ticksByAlert.set(key, [row]);
     }
 
     const updates: EnrichUpdate[] = [];
     const noTickIds: number[] = [];
 
     for (const alert of alerts) {
-      const ticks = ticksByAlert.get(alert.id);
+      // Normalise ONCE — alert.id is a BIGINT string off the wire.
+      const alertId = Number(alert.id);
+      const ticks = ticksByAlert.get(alertId);
 
       if (!ticks || ticks.length === 0) {
         // No post-entry ticks → nothing to compute. Collect for a TERMINAL
@@ -192,7 +210,7 @@ export default withCronInstrumentation(
         // becomes permanently un-enrichable while still accumulating in the
         // scan. Realized/peak columns stay NULL so a no-tick alert is
         // distinguishable from a real outcome (no bogus 0).
-        noTickIds.push(alert.id);
+        noTickIds.push(alertId);
         skipped++;
         continue;
       }
@@ -228,7 +246,7 @@ export default withCronInstrumentation(
       const trail30 = realizedTrailAct30Trail10(prices, alert.entryPrice);
 
       updates.push({
-        id: alert.id,
+        id: alertId,
         peak,
         minToPeak,
         r30,

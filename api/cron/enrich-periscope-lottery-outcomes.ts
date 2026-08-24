@@ -219,16 +219,26 @@ export default withCronInstrumentation(
     )) as BatchedTradeRow[];
 
     // Group ticks by fire id (already ordered executed_at ASC per id).
+    //
+    // Number() on BOTH sides is load-bearing — the ids arrive as DIFFERENT
+    // JS types: periscope_lottery_fires.id is BIGINT and comes back from the
+    // Neon driver as a STRING ("1"), while `u.id AS fire_id` out of the
+    // unnest is a NUMBER. A JS Map does not coerce, so an un-normalised
+    // get() misses every entry and every fire gets locked at realized_r = -1
+    // as "no trades observed". Third occurrence of this defect: lottery (600
+    // fires, 2826ee4a) and silent boom (634 alerts) had it first. Do not drop
+    // these casts; the mixed-type case is pinned by a test.
     const ticksById = new Map<number, BatchedTradeRow[]>();
     for (const row of tradeRows) {
-      const arr = ticksById.get(row.fire_id);
+      const key = Number(row.fire_id);
+      const arr = ticksById.get(key);
       if (arr) arr.push(row);
-      else ticksById.set(row.fire_id, [row]);
+      else ticksById.set(key, [row]);
     }
 
     const updates: EnrichUpdate[] = [];
     for (const w of windows) {
-      const ticks = ticksById.get(w.id) ?? [];
+      const ticks = ticksById.get(Number(w.id)) ?? [];
 
       // Peak metrics over the hold window (executed_at <= horizonEnd). If
       // no trades observed, leave outcome NULL but still lock the row (the

@@ -109,6 +109,45 @@ describe('enrich-periscope-lottery-outcomes cron', () => {
     expect(params[6][0]).toBeCloseTo(-0.5, 2);
   });
 
+  it('joins ticks when the driver hands back a STRING fire id and unnest a NUMBER', async () => {
+    // PRODUCTION TYPES — periscope_lottery_fires.id is BIGINT, which the Neon
+    // serverless driver returns as a STRING ("1"), while `SELECT u.id AS
+    // fire_id FROM unnest(${ids}::bigint[])` yields a NUMBER. A JS Map does
+    // not coerce, so `ticksById.get(w.id)` misses EVERY entry and every fire
+    // is locked at realized_r = -1 as "no trades observed".
+    //
+    // Third occurrence of this defect: lottery (600 fires, fixed 7e262c82),
+    // silent boom (634 alerts), and here. Every test in this file mocks BOTH
+    // sides as numbers, which is why it shipped green. Mirror production.
+    const fire = {
+      id: '1' as unknown as number,
+      fire_type: 'call_lottery',
+      fire_time: '2026-05-18T18:43:12Z',
+      expiry: '2026-05-18',
+      trade_strike: 7430,
+      entry_px: '0.10',
+    };
+    const tradeRows = [
+      { fire_id: 1, executed_at: '2026-05-18T18:45:00Z', price: '0.50' },
+      { fire_id: 1, executed_at: '2026-05-18T19:01:47Z', price: '25.00' },
+    ];
+
+    mockSql.mockResolvedValueOnce([fire]); // 1: SELECT unenriched
+    mockSql.mockResolvedValueOnce(tradeRows); // 2: batched LATERAL read
+    mockSql.mockResolvedValueOnce([]); // 3: batched UPDATE
+
+    const req = mockRequest({ method: 'GET' });
+    const res = mockResponse();
+    await handler(req, res);
+
+    expect(res._json).toMatchObject({ status: 'success', rows: 1, updated: 1 });
+
+    // The peak must be the real $25 tick, NOT the -1 "no trades" lock.
+    const params = (mockSql.mock.calls[2] ?? []).slice(1);
+    expect(params[1]).toEqual([25]);
+    expect(params[5][0]).toBeCloseTo(249, 2);
+  });
+
   it('binds the unnest arrays with casts that match the column types', async () => {
     // Regression guard for OPTIONS-STRIKE-CALCULATOR-46,
     // "NeonDbError: operator does not exist: date = text" — this cron 500'd

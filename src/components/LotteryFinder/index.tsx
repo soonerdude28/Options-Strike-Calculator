@@ -1221,6 +1221,15 @@ export function LotteryFinderSection({
             </FilterChip>
           );
         })}
+        {lotteryFinder.data?.takeitUnavailable === true && (
+          <span
+            className="inline-flex items-center gap-1 rounded border border-amber-700/60 bg-amber-950/40 px-1.5 py-0.5 text-[10px] text-amber-300"
+            title="No TAKE-IT model is published, so every row is unscored. The floor was ignored for this request — applying it would hide every row."
+            data-testid="lottery-takeit-unavailable"
+          >
+            no TAKE-IT model — floor ignored
+          </span>
+        )}
         {takeitFloor !== DEFAULT_TAKEIT_FLOOR && (
           <span
             className="inline-flex items-center gap-1 text-[10px] text-neutral-400"

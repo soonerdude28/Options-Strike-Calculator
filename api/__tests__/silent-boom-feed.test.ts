@@ -1170,6 +1170,9 @@ describe('silent-boom-feed handler', () => {
     // stripped ~40 of 50 rows per page when default 0.70 was active
     // and produced 16+ mostly-empty pages. Mirrors the lottery fix.
     mockSql
+      // A floor makes the handler probe TAKE-IT coverage FIRST. Report the
+      // day as scored so the floor applies instead of failing open.
+      .mockResolvedValueOnce([{ total: 5, scored: 5 }])
       .mockResolvedValueOnce([{ n: 0 }])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
@@ -1184,8 +1187,9 @@ describe('silent-boom-feed handler', () => {
     expect(body.filters.minTakeitProb).toBe(0.7);
 
     // Count + rows query both bind the floor value.
-    const countCall = mockSql.mock.calls[0] as unknown[];
-    const rowsCall = mockSql.mock.calls[1] as unknown[];
+    // calls[0] is the coverage probe; count + rows follow it.
+    const countCall = mockSql.mock.calls[1] as unknown[];
+    const rowsCall = mockSql.mock.calls[2] as unknown[];
     expect(countCall.slice(1)).toContain(0.7);
     expect(rowsCall.slice(1)).toContain(0.7);
 
@@ -1194,6 +1198,101 @@ describe('silent-boom-feed handler', () => {
     const rowsSql = (rowsCall[0] as TemplateStringsArray).join(' ');
     expect(countSql).toContain('takeit_prob >=');
     expect(rowsSql).toContain('takeit_prob >=');
+  });
+
+  // TAKE-IT floor fail-open — spec takeit-floor-fail-open-2026-08-23.md.
+  // With no model published every takeit_prob is NULL and `NULL >= 0.70` is
+  // NULL, so the floor drops every alert and the feed empties with no reason
+  // shown. It must fail OPEN in that one case, and say so.
+  describe('TAKE-IT floor fail-open', () => {
+    it('bypasses the floor and flags it when alerts exist but none are scored', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 206, scored: 0 }]) // coverage probe
+        .mockResolvedValueOnce([{ n: 0 }])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-07', minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(res._status).toBe(200);
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(true);
+      expect(body.filters.minTakeitProb).toBeNull();
+
+      const bound = mockSql.mock.calls
+        .flatMap((c) => (c as unknown[]).slice(1))
+        .filter((v) => v === 0.7);
+      expect(bound).toHaveLength(0);
+    });
+
+    it('still filters normally when at least one alert is scored', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 206, scored: 3 }])
+        .mockResolvedValueOnce([{ n: 0 }])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-07', minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(false);
+      expect(body.filters.minTakeitProb).toBe(0.7);
+    });
+
+    it('an empty day is not reported unavailable', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 0, scored: 0 }])
+        .mockResolvedValueOnce([{ n: 0 }])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-09', minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(
+        (res._json as { takeitUnavailable: boolean }).takeitUnavailable,
+      ).toBe(false);
+    });
+
+    it('does not probe when no floor is requested', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ n: 0 }])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-07' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      const probed = mockSql.mock.calls.some((c) => {
+        const strings = c[0] as TemplateStringsArray | undefined;
+        return strings ? strings.join(' ').includes('AS scored') : false;
+      });
+      expect(probed).toBe(false);
+    });
   });
 
   it('omits minTakeitProb from filters echo when not provided', async () => {

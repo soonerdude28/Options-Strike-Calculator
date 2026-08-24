@@ -371,7 +371,11 @@ describe('lottery-finder endpoint', () => {
     // chain-level MAX, which only grows → a chain that ever qualified
     // can never disappear. Assert the generated SQL reflects that and
     // never reverts to per-representative gating.
-    mockSql.mockResolvedValueOnce([ROW]).mockResolvedValueOnce([{ total: 1 }]);
+    mockSql
+      // A floor makes the handler probe coverage first — say it is scored.
+      .mockResolvedValueOnce([{ total: 1, scored: 1 }])
+      .mockResolvedValueOnce([ROW])
+      .mockResolvedValueOnce([{ total: 1 }]);
     const req = mockRequest({ method: 'GET', query: { minTakeitProb: '0.7' } });
     const res = mockResponse();
     await handler(req, res);
@@ -386,6 +390,109 @@ describe('lottery-finder endpoint', () => {
     // The old, non-monotonic gates must be gone.
     expect(allSql).not.toContain('f.takeit_prob >=');
     expect(allSql).not.toContain('OR takeit_prob >=');
+  });
+
+  // ============================================================
+  // TAKE-IT FLOOR FAIL-OPEN (takeit-floor-fail-open-2026-08-23)
+  // ============================================================
+  // The floor excludes NULL scores, which is right while a model exists.
+  // With NO model published every takeit_prob is NULL, `NULL >= 0.70` is
+  // NULL, and the floor drops EVERY row — the feed goes silently empty.
+  // That shipped: the bundles were missing from Blob and all 16,858 fires
+  // over Aug 17-21 were unscored, so the default floor returned nothing.
+  describe('TAKE-IT floor fail-open', () => {
+    it('bypasses the floor and flags it when the day has rows but no scores', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 4371, scored: 0 }]) // coverage probe
+        .mockResolvedValueOnce([ROW])
+        .mockResolvedValueOnce([{ total: 1, suppressed: 0 }]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(res._status).toBe(200);
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(true);
+      // `applied` reports what was ACTUALLY applied — nothing.
+      expect(body.filters.minTakeitProb).toBeNull();
+
+      // The bypass is only real if the value reaches no query at all.
+      const bound = mockSql.mock.calls
+        .flatMap((c) => (c as unknown[]).slice(1))
+        .filter((v) => v === 0.7);
+      expect(bound).toHaveLength(0);
+    });
+
+    it('still filters normally when the day has at least one score', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 4371, scored: 12 }])
+        .mockResolvedValueOnce([ROW])
+        .mockResolvedValueOnce([{ total: 1, suppressed: 0 }]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(false);
+      expect(body.filters.minTakeitProb).toBe(0.7);
+      const bound = mockSql.mock.calls
+        .flatMap((c) => (c as unknown[]).slice(1))
+        .filter((v) => v === 0.7);
+      expect(bound.length).toBeGreaterThan(0);
+    });
+
+    it('a day with no fires at all is NOT reported unavailable', async () => {
+      // Weekends/holidays have zero fires. A false "model unavailable"
+      // banner on every non-trading day would train the user to ignore it.
+      mockSql
+        .mockResolvedValueOnce([{ total: 0, scored: 0 }])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ total: 0, suppressed: 0 }]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(
+        (res._json as { takeitUnavailable: boolean }).takeitUnavailable,
+      ).toBe(false);
+    });
+
+    it('does not probe at all when no floor is requested', async () => {
+      mockSql
+        .mockResolvedValueOnce([ROW])
+        .mockResolvedValueOnce([{ total: 1, suppressed: 0 }]);
+
+      const req = mockRequest({ method: 'GET', query: {} });
+      const res = mockResponse();
+      await handler(req, res);
+
+      const probed = mockSql.mock.calls.some((c) => {
+        const strings = c[0] as TemplateStringsArray | undefined;
+        return strings ? strings.join(' ').includes('AS scored') : false;
+      });
+      expect(probed).toBe(false);
+      expect(
+        (res._json as { takeitUnavailable: boolean }).takeitUnavailable,
+      ).toBe(false);
+    });
   });
 
   // ============================================================
@@ -408,6 +515,7 @@ describe('lottery-finder endpoint', () => {
       'sort=%s gates the rows query on chain-max TAKE-IT, never the latest fire',
       async (sort) => {
         mockSql
+          .mockResolvedValueOnce([{ total: 1, scored: 1 }])
           .mockResolvedValueOnce([ROW])
           .mockResolvedValueOnce([{ total: 1, suppressed: 0 }]);
 
@@ -418,9 +526,10 @@ describe('lottery-finder endpoint', () => {
         const res = mockResponse();
         await handler(req, res);
 
-        // calls[0] is the rows query for the selected sort branch.
+        // calls[0] is the TAKE-IT coverage probe; calls[1] is the rows
+        // query for the selected sort branch.
         const rowsSql = (
-          mockSql.mock.calls[0]![0] as TemplateStringsArray
+          mockSql.mock.calls[1]![0] as TemplateStringsArray
         ).join('?');
         // The chain-level MAX window must be present and the gate must
         // reference it — not the representative row's scalar.
@@ -432,6 +541,7 @@ describe('lottery-finder endpoint', () => {
 
     it('the COUNT(*) total query also gates on chain-max (so total matches reachable rows)', async () => {
       mockSql
+        .mockResolvedValueOnce([{ total: 1, scored: 1 }])
         .mockResolvedValueOnce([ROW])
         .mockResolvedValueOnce([{ total: 1, suppressed: 0 }]);
 
@@ -442,8 +552,8 @@ describe('lottery-finder endpoint', () => {
       const res = mockResponse();
       await handler(req, res);
 
-      // calls[1] is the COUNT(*) total query.
-      const countSql = (mockSql.mock.calls[1]![0] as TemplateStringsArray).join(
+      // calls[0] is the coverage probe; calls[2] is the COUNT(*) total query.
+      const countSql = (mockSql.mock.calls[2]![0] as TemplateStringsArray).join(
         '?',
       );
       expect(countSql).toContain('MAX(takeit_prob) OVER');
@@ -900,6 +1010,7 @@ describe('lottery-finder endpoint', () => {
     // (ticker/type/mode/tod). This pins that the quality GATES are absent
     // from the reignited query while remaining on the main feed.
     mockSql
+      .mockResolvedValueOnce([{ total: 1, scored: 1 }]) // coverage probe
       .mockResolvedValueOnce([ROW]) // rows
       .mockResolvedValueOnce([{ total: 1, suppressed: 0 }]) // COUNT
       .mockResolvedValue([]); // chainExtras, mega-cluster, reignited, …
@@ -936,8 +1047,9 @@ describe('lottery-finder endpoint', () => {
     }
 
     // Sanity: the MAIN rows query DOES still gate on chain-max (the
-    // no-vanish guard must remain intact for the main feed).
-    const mainSql = (mockSql.mock.calls[0]![0] as TemplateStringsArray).join(
+    // no-vanish guard must remain intact for the main feed). calls[0] is
+    // the TAKE-IT coverage probe, so the rows query is calls[1].
+    const mainSql = (mockSql.mock.calls[1]![0] as TemplateStringsArray).join(
       '?',
     );
     expect(mainSql).toContain('f.chain_max_takeit >=');
@@ -2397,6 +2509,7 @@ describe('lottery-finder endpoint', () => {
     it('FIX A: ever_qualifying array_agg is decoupled from burst/takeit/minScore (only quintile>2 filters it)', async () => {
       mockReadKeptTickers.mockResolvedValueOnce([]);
       mockSql
+        .mockResolvedValueOnce([{ total: 1, scored: 1 }])
         .mockResolvedValueOnce([rowWithQuintile(1, 'AAA', 3)])
         .mockResolvedValueOnce([
           { total: 1, suppressed: 0, ever_qualifying: ['AAA'] },
@@ -2415,7 +2528,7 @@ describe('lottery-finder endpoint', () => {
       const res = mockResponse();
       await handler(req, res);
 
-      const countSql = (mockSql.mock.calls[1]![0] as TemplateStringsArray).join(
+      const countSql = (mockSql.mock.calls[2]![0] as TemplateStringsArray).join(
         '?',
       );
       // The user-filter gate is collected into a SEPARATE passes_user_filters

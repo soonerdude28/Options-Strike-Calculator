@@ -15,6 +15,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getDb, withDbRetry } from './_lib/db.js';
 import { sendDbErrorResponse } from './_lib/transient-db-response.js';
+import { getTakeitCoverage } from './_lib/takeit-availability.js';
 import {
   guardOwnerOrGuestEndpoint,
   setCacheHeaders,
@@ -274,6 +275,9 @@ interface SilentBoomFeedResponse {
     aggressivePremium: boolean;
     minTakeitProb: number | null;
   };
+  /** True when a floor was requested but nothing that day is scored, so the
+   *  floor was bypassed instead of silently emptying the feed. */
+  takeitUnavailable: boolean;
   count: number;
   total: number;
   limit: number;
@@ -374,7 +378,9 @@ export default async function handler(
   // fix in api/lottery-finder.ts. NULL takeit rows (not yet enriched)
   // are excluded when the floor is on — matches the prior client
   // behavior at SilentBoomSection.tsx:692-694.
-  const minTakeitProb =
+  // Raw request value; the EFFECTIVE floor is resolved once `db` exists,
+  // because a floor with no published model must fail open.
+  const requestedTakeitFloor =
     q.minTakeitProb != null && q.minTakeitProb > 0 ? q.minTakeitProb : null;
   // Hide alerts whose bucket_ct (in CT) is at or after 14:30. When
   // active, this is a server-side filter so pagination accurately
@@ -420,6 +426,17 @@ export default async function handler(
 
   try {
     const db = getDb();
+
+    // With NO model published every takeit_prob is NULL, `NULL >= 0.70` is
+    // NULL, and the floor drops every row — the feed empties with no reason
+    // shown. Probe once (only when a floor is on) and fail the floor OPEN in
+    // that case. Spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+    const takeitCoverage =
+      requestedTakeitFloor == null
+        ? null
+        : await getTakeitCoverage(db, 'silent_boom', date);
+    const takeitUnavailable = takeitCoverage?.unavailable === true;
+    const minTakeitProb = takeitUnavailable ? null : requestedTakeitFloor;
 
     // Build the WHERE clause incrementally — using neon-serverless
     // tagged template requires us to execute one of a few precomposed
@@ -697,6 +714,7 @@ export default async function handler(
         aggressivePremium,
         minTakeitProb: minTakeitProb ?? null,
       },
+      takeitUnavailable,
       count: alerts.length,
       total,
       limit: q.limit,

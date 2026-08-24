@@ -422,6 +422,13 @@ export interface LotteryFinderResponse {
     minFireCount?: number | null;
     minTakeitProb?: number | null;
   };
+  /**
+   * True when a TAKE-IT floor was requested but nothing that day carries a
+   * score, so the floor was bypassed rather than silently emptying the feed.
+   * Set when no model bundle is published — see
+   * docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md.
+   */
+  takeitUnavailable?: boolean;
   /** Number of fires actually returned in this response (≤ limit). */
   count: number;
   /**

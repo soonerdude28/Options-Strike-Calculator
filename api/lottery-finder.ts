@@ -22,6 +22,7 @@ import {
   setCacheHeaders,
 } from './_lib/api-helpers.js';
 import { sendDbErrorResponse } from './_lib/transient-db-response.js';
+import { getTakeitCoverage } from './_lib/takeit-availability.js';
 import { lotteryFinderQuerySchema } from './_lib/validation.js';
 import {
   gammaScoreAdjustment,
@@ -507,7 +508,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // was active and made "page 1 of N" meaningless. NULL takeit
     // values are excluded when the floor is on (matches the prior
     // client-side `(f) => f.takeitProb != null && f.takeitProb >= floor`).
-    const minTakeitProb =
+    // Raw request value. The EFFECTIVE floor is resolved after `db` is
+    // available, because a floor with no published model must fail open —
+    // see the getTakeitCoverage call below.
+    const requestedTakeitFloor =
       parsed.data.minTakeitProb != null && parsed.data.minTakeitProb > 0
         ? parsed.data.minTakeitProb
         : null;
@@ -563,6 +567,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const reignitionWindowEnd = windowEnd;
 
     const db = getDb();
+
+    // The floor excludes NULL scores — correct while a model exists, since an
+    // unscored fire really is below it. With NO model published, `NULL >= 0.70`
+    // is NULL and EVERY row drops: the feed goes silently empty. Probe once
+    // (only when a floor is actually on) and fail the floor OPEN in that case,
+    // reporting `takeitUnavailable` so the UI can say why the filter is off.
+    // Spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+    const takeitCoverage =
+      requestedTakeitFloor == null
+        ? null
+        : await getTakeitCoverage(db, 'lottery', targetDate);
+    const takeitUnavailable = takeitCoverage?.unavailable === true;
+    const minTakeitProb = takeitUnavailable ? null : requestedTakeitFloor;
 
     // MONOTONIC Q1/Q2 SUPPRESSION (defense-in-depth for the server feed).
     // `inversion_quintile` on lottery_ticker_stats is recomputed by the
@@ -1723,6 +1740,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         maxFireCount: maxFireCount ?? null,
         minTakeitProb: minTakeitProb ?? null,
       },
+      // True when a floor was requested but no fire that day carries a score,
+      // so the floor was bypassed rather than silently emptying the feed.
+      takeitUnavailable,
       // count = rows returned (≤ limit). total = total matching rows
       // before LIMIT/OFFSET. UI uses (offset, limit, total) for the
       // page-N-of-M display + prev/next controls.

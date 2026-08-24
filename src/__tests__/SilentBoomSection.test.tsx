@@ -1856,3 +1856,37 @@ describe('SilentBoomSection: pagination edge states', () => {
     expect(lastCall?.[0]).toMatchObject({ page: 0 });
   });
 });
+
+// ============================================================
+// TAKE-IT UNAVAILABLE NOTICE (takeit-floor-fail-open-2026-08-23)
+// ============================================================
+// With no model bundle published every alert is unscored and the
+// server-side 0.70 floor would drop all of them. The endpoint fails the
+// floor open and flags it; the UI must explain why the filter is off.
+describe('SilentBoomSection: TAKE-IT unavailable notice', () => {
+  it('shows the notice when the server bypassed the floor', () => {
+    mockUseSilentBoomFeed.mockReturnValue({
+      ...defaultHookResult,
+      data: { ...defaultHookResult.data, takeitUnavailable: true },
+    });
+    render(<SilentBoomSection marketOpen={false} />);
+    expect(
+      screen.getByTestId('silentboom-takeit-unavailable'),
+    ).toBeInTheDocument();
+  });
+
+  it('stays hidden when a model is published', () => {
+    mockUseSilentBoomFeed.mockReturnValue({
+      ...defaultHookResult,
+      data: { ...defaultHookResult.data, takeitUnavailable: false },
+    });
+    render(<SilentBoomSection marketOpen={false} />);
+    expect(screen.queryByTestId('silentboom-takeit-unavailable')).toBeNull();
+  });
+
+  it('stays hidden when the response omits the flag', () => {
+    mockUseSilentBoomFeed.mockReturnValue(defaultHookResult);
+    render(<SilentBoomSection marketOpen={false} />);
+    expect(screen.queryByTestId('silentboom-takeit-unavailable')).toBeNull();
+  });
+});

@@ -2317,3 +2317,40 @@ describe('LotteryFinderSection: pagination edge states', () => {
     expect(lastCall?.[0]).toMatchObject({ page: 0 });
   });
 });
+
+// ============================================================
+// TAKE-IT UNAVAILABLE NOTICE (takeit-floor-fail-open-2026-08-23)
+// ============================================================
+// When no model bundle is published every fire is unscored, and the
+// server-side 0.70 floor would drop every row. The endpoint fails the
+// floor open and sets `takeitUnavailable`; the UI has to say so, or the
+// feed silently looks unfiltered for no visible reason.
+describe('LotteryFinderSection: TAKE-IT unavailable notice', () => {
+  it('shows the notice when the server bypassed the floor', () => {
+    mockUseLotteryFinder.mockReturnValue({
+      ...defaultHookResult,
+      data: { ...defaultHookResult.data, takeitUnavailable: true },
+    });
+    render(<LotteryFinderSection marketOpen={false} />);
+    expect(
+      screen.getByTestId('lottery-takeit-unavailable'),
+    ).toBeInTheDocument();
+  });
+
+  it('stays hidden when a model is published', () => {
+    mockUseLotteryFinder.mockReturnValue({
+      ...defaultHookResult,
+      data: { ...defaultHookResult.data, takeitUnavailable: false },
+    });
+    render(<LotteryFinderSection marketOpen={false} />);
+    expect(screen.queryByTestId('lottery-takeit-unavailable')).toBeNull();
+  });
+
+  it('stays hidden when the response omits the flag', () => {
+    // A last-good-cache replay predates the field. `=== true` must treat
+    // undefined as "model is fine", never as an outage.
+    mockUseLotteryFinder.mockReturnValue(defaultHookResult);
+    render(<LotteryFinderSection marketOpen={false} />);
+    expect(screen.queryByTestId('lottery-takeit-unavailable')).toBeNull();
+  });
+});

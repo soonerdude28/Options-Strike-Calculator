@@ -320,6 +320,27 @@ async function enrichBatch(
             FROM ws_option_trades
            WHERE option_chain = u.chain
              AND executed_at >= u.entry
+             -- Upper bound: END of the entry's CT calendar day, exclusive.
+             -- Without it this join absorbs the NEXT session's prints on the
+             -- same option_chain whenever a row is enriched on a later
+             -- trading day (cron outage, LIMIT backlog, wall-budget cut, or a
+             -- handler 500 — all observed here). 67% of fires are DTE>=1, so
+             -- the contract is still trading and the join still matches.
+             --
+             -- Bound on the CT DAY, not the 15:00 CT close: measured on a full
+             -- day, prints run to 15:59:58 CT (46,743 after 15:00), so a
+             -- close-based cutoff would truncate real tape. Nothing prints
+             -- between 16:00 CT and the next 08:30 CT open, so this is a
+             -- no-op on correct runs. TZ math is on the u.entry side, leaving
+             -- executed_at bare so its index still serves the range scan.
+             -- Use + INTERVAL '1 day', never + 1: date+int yields a DATE, which
+             -- Postgres casts to timestamptz in the SESSION zone before AT TIME
+             -- ZONE, so the operator converts TO Chicago instead of interpreting
+             -- AS Chicago — the bound collapses to UTC-midnight-in-CT and
+             -- truncates mid-session. date+interval yields a timestamp, which is
+             -- interpreted correctly. Same reason cleanup-ws-option-trades.ts
+             -- uses - INTERVAL '2 days'.
+             AND executed_at < (((u.entry AT TIME ZONE 'America/Chicago')::date + INTERVAL '1 day') AT TIME ZONE 'America/Chicago')
              AND canceled = FALSE
              AND price > 0
            ORDER BY executed_at ASC

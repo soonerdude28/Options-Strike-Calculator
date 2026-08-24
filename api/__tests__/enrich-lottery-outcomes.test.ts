@@ -1018,4 +1018,39 @@ describe('enrich-lottery-outcomes', () => {
       });
     });
   });
+
+  // ── same-CT-day tick bound ────────────────────────────────────────────────
+  // The LATERAL had no upper bound on executed_at. For any alert enriched on a
+  // LATER trading day than its own — reachable via a cron outage, a LIMIT
+  // backlog, a wall-budget cut, or a handler that 500s (all of which have
+  // happened here) — it absorbed the NEXT session's prints on the same option
+  // chain. 67%% of lottery fires and 71%% of silent-boom alerts are DTE>=1, so
+  // the contract keeps trading and the join keeps matching. A replay of one
+  // Friday's fires against the following Monday's tape produced peaks of
+  // +1,498%% against a stored +5%%.
+  //
+  // The bound is the END OF THE ENTRY'S CT CALENDAR DAY, not the 15:00 CT
+  // close: measured on a full day, prints run to 15:59:58 CT (46,743 of them
+  // after 15:00), so a close-based cutoff would silently truncate real tape.
+  // Nothing prints between 16:00 CT and the next 08:30 CT open, so this bound
+  // is a no-op on correct runs and only ever removes cross-session rows.
+  it('bounds the tick read to the entry CT calendar day', async () => {
+    mockSql.mockResolvedValueOnce([baseFire]); // SELECT fires
+    mockSql.mockResolvedValue([]);
+    const req = mockRequest({
+      method: 'GET',
+      headers: { authorization: 'Bearer test-secret' },
+    });
+    const res = mockResponse();
+    await handler(req, res);
+
+    const tickSql = mockSql.mock.calls
+      .map((c) => (Array.isArray(c[0]) ? (c[0] as string[]).join(' ') : ''))
+      .find((s) => s.includes('JOIN LATERAL') && s.includes('executed_at >='));
+
+    expect(tickSql).toBeDefined();
+    // Upper bound present, on the CT calendar day, exclusive.
+    expect(tickSql).toContain('America/Chicago');
+    expect(tickSql).toMatch(/executed_at\s*<\s*\(/);
+  });
 });

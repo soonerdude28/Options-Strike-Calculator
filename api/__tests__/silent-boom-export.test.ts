@@ -162,7 +162,9 @@ describe('silent-boom-export handler', () => {
     // never applied it — the CSV was the full firehose while the
     // on-screen feed was TAKE-IT-floored. The predicate must mirror
     // the feed exactly.
-    mockSql.mockResolvedValueOnce([makeRow()]);
+    mockSql
+      .mockResolvedValueOnce([{ total: 9, scored: 9 }]) // coverage probe
+      .mockResolvedValueOnce([makeRow()]);
     const req = mockRequest({
       method: 'GET',
       query: { date: '2026-05-07', minTakeitProb: '0.7' },
@@ -171,8 +173,9 @@ describe('silent-boom-export handler', () => {
     await handler(req, res);
 
     expect(res._status).toBe(200);
-    expect(mockSql).toHaveBeenCalledTimes(1);
-    const call = mockSql.mock.calls[0] as unknown[];
+    // probe + export query
+    expect(mockSql).toHaveBeenCalledTimes(2);
+    const call = mockSql.mock.calls[1] as unknown[];
     const sqlText = (call[0] as TemplateStringsArray).join(' ');
     // Exact predicate mirrors api/silent-boom-feed.ts.
     expect(sqlText).toContain('takeit_prob >=');
@@ -194,7 +197,9 @@ describe('silent-boom-export handler', () => {
   });
 
   it('echoes minTakeitProb in the JSON filters block (Fix 1 parity)', async () => {
-    mockSql.mockResolvedValueOnce([makeRow()]);
+    mockSql
+      .mockResolvedValueOnce([{ total: 9, scored: 9 }]) // coverage probe
+      .mockResolvedValueOnce([makeRow()]);
     const req = mockRequest({
       method: 'GET',
       query: { date: '2026-05-07', format: 'json', minTakeitProb: '0.7' },
@@ -441,5 +446,61 @@ describe('silent-boom-export ↔ feed filter-bucket parity', () => {
     const { binds } = await captureExportSql({ date: '2026-05-07' });
     // todLo, todHi, dteLo, burstLo, askPctLo all bind null.
     expect(binds.filter((b) => b === null).length).toBeGreaterThanOrEqual(5);
+  });
+
+  // ── TAKE-IT floor fail-open ───────────────────────────────────────────────
+  // spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+  // The feed endpoints got this guard in fa68e351; these siblings bind the
+  // IDENTICAL predicate and were missed, so with no model published the
+  // default 0.70 floor returned zero rows here while the feed showed data.
+  describe('TAKE-IT floor fail-open', () => {
+    it('bypasses the floor and flags it when nothing that day is scored', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 206, scored: 0 }]) // coverage probe
+        .mockResolvedValueOnce([makeRow()]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: {
+          date: '2026-05-07',
+          minTakeitProb: '0.7',
+          format: 'json',
+        },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(res._status).toBe(200);
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(true);
+      expect(body.filters.minTakeitProb).toBeNull();
+      const bound = mockSql.mock.calls
+        .flatMap((c) => (c as unknown[]).slice(1))
+        .filter((v) => v === 0.7);
+      expect(bound).toHaveLength(0);
+    });
+
+    it('still filters normally when the day has at least one score', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 206, scored: 4 }])
+        .mockResolvedValueOnce([makeRow()]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-07', minTakeitProb: '0.7', format: 'json' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(false);
+      expect(body.filters.minTakeitProb).toBe(0.7);
+    });
   });
 });

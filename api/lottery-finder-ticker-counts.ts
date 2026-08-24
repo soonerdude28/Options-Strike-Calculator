@@ -22,6 +22,7 @@ import {
   setCacheHeaders,
 } from './_lib/api-helpers.js';
 import { sendDbErrorResponse } from './_lib/transient-db-response.js';
+import { getTakeitCoverage } from './_lib/takeit-availability.js';
 import { lotteryFinderTickerCountsQuerySchema } from './_lib/validation.js';
 import { readKeptTickers } from './_lib/kept-tickers.js';
 import { keptSuppressionSql } from './_lib/lottery-suppression.js';
@@ -41,6 +42,9 @@ interface CountRow {
 }
 
 interface LotteryFinderTickerCountsResponse {
+  /** True when a floor was requested but nothing that day is scored, so the
+   *  floor was bypassed rather than silently emptying the result. */
+  takeitUnavailable: boolean;
   date: string;
   filters: {
     optionType: 'C' | 'P' | null;
@@ -98,12 +102,27 @@ export default async function handler(
     q.minFireCount != null && q.minFireCount > 1 ? q.minFireCount : null;
   const maxFireCount =
     q.maxFireCount != null && q.maxFireCount >= 1 ? q.maxFireCount : null;
-  const minTakeitProb =
+  // Raw request value; the EFFECTIVE floor is resolved once `db` exists,
+  // because a floor with no published model must fail open.
+  const requestedTakeitFloor =
     q.minTakeitProb != null && q.minTakeitProb > 0 ? q.minTakeitProb : null;
   const showAll = q.showAll ?? false;
 
   try {
     const db = getDb();
+
+    // The floor excludes NULL scores — right while a model exists, wrong when
+    // none is published: `NULL >= 0.70` is NULL and EVERY row drops. The feed
+    // endpoints got this guard in fa68e351; this sibling binds the identical
+    // predicate and was missed, so the strip/export went empty while the feed
+    // showed data. Probe only when a floor is on, then fail the floor OPEN.
+    // Spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+    const takeitCoverage =
+      requestedTakeitFloor == null
+        ? null
+        : await getTakeitCoverage(db, 'lottery', date);
+    const takeitUnavailable = takeitCoverage?.unavailable === true;
+    const minTakeitProb = takeitUnavailable ? null : requestedTakeitFloor;
 
     // MONOTONIC Q1/Q2 SUPPRESSION (mirror of /api/lottery-finder). Read the
     // per-day kept-set so chips for tickers that were ever shown (quintile
@@ -239,6 +258,7 @@ export default async function handler(
         minTakeitProb,
         showAll,
       },
+      takeitUnavailable,
       tickers: rows.map((r) => ({
         ticker: r.ticker,
         count: r.count,

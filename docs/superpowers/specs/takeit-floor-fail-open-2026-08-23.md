@@ -94,6 +94,30 @@ bypassed) — it is named "applied", and `takeitUnavailable` carries the reason.
   several queries; a `count(*) / count(takeit_prob)` on an indexed `date` is cheap,
   and the common floor-off path pays nothing.
 
+## Follow-up: the three siblings this originally missed (2026-08-24)
+
+The first pass guarded only `api/lottery-finder.ts` and `api/silent-boom-feed.ts`.
+Three more endpoints bind the **identical** predicate and were left unguarded, so
+with no model published they returned zero rows while the feeds showed data:
+
+| endpoint                              | line | predicate                              |
+| ------------------------------------- | ---- | -------------------------------------- |
+| `api/lottery-finder-ticker-counts.ts` | 196  | `chain_max_takeit >= ${minTakeitProb}` |
+| `api/silent-boom-ticker-counts.ts`    | 178  | `takeit_prob >= ${minTakeitProb}`      |
+| `api/silent-boom-export.ts`           | 172  | `takeit_prob >= ${minTakeitProb}`      |
+
+User-visible effect: both ticker chip strips empty, and the CSV export produced
+nothing, at the default 0.70 floor.
+
+All three now call `getTakeitCoverage` and fail the floor open on the same terms.
+`silent-boom-export` has no body field to carry the flag on its CSV path, so it
+sets an `X-Takeit-Unavailable: 1` response header there; its `format=json` path
+carries `takeitUnavailable` like the others.
+
+**Lesson for the next predicate change:** grep for the _predicate_, not the
+endpoint. `grep -rn 'minTakeitProb' api --include='*.ts' | grep -v __tests__`
+lists every binding site in one shot and would have caught all five at once.
+
 ## Out of scope
 
 Retraining. Silent Boom has zero labeled rows and lottery has one week (16,858),

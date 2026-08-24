@@ -369,4 +369,57 @@ describe('silent-boom-ticker-counts handler', () => {
     expect(res._json).toMatchObject({ transient: true });
     expect(res._headers['Retry-After']).toBe('5');
   });
+
+  // ── TAKE-IT floor fail-open ───────────────────────────────────────────────
+  // spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+  // The feed endpoints got this guard in fa68e351; these siblings bind the
+  // IDENTICAL predicate and were missed, so with no model published the
+  // default 0.70 floor returned zero rows here while the feed showed data.
+  describe('TAKE-IT floor fail-open', () => {
+    it('bypasses the floor and flags it when nothing that day is scored', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 4371, scored: 0 }]) // coverage probe
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-14', minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(res._status).toBe(200);
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(true);
+      expect(body.filters.minTakeitProb).toBeNull();
+      // The bypass is only real if the value reaches no query at all.
+      const bound = mockSql.mock.calls
+        .flatMap((c) => (c as unknown[]).slice(1))
+        .filter((v) => v === 0.7);
+      expect(bound).toHaveLength(0);
+    });
+
+    it('still filters normally when the day has at least one score', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 4371, scored: 9 }])
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-14', minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(false);
+      expect(body.filters.minTakeitProb).toBe(0.7);
+    });
+  });
 });

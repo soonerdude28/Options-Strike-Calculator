@@ -18,6 +18,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getDb, withDbRetry } from './_lib/db.js';
 import { DB_RETRY_ATTEMPTS, DB_RETRY_TIMEOUT_MS } from './_lib/constants.js';
 import { sendDbErrorResponse } from './_lib/transient-db-response.js';
+import { getTakeitCoverage } from './_lib/takeit-availability.js';
 import { guardOwnerEndpoint } from './_lib/auth-helpers.js';
 import { silentBoomExportQuerySchema } from './_lib/validation.js';
 import { getETDateStr } from '../src/utils/timezone.js';
@@ -139,12 +140,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // feed is TAKE-IT-floored but the export previously ignored this
     // param, dumping the full firehose). NULL takeit rows (not yet
     // enriched) are excluded when the floor is on — same as the feed.
-    const minTakeitProb =
+    // Raw request value; resolved to the EFFECTIVE floor once `db` exists.
+    const requestedTakeitFloor =
       minTakeitProbRaw != null && minTakeitProbRaw > 0
         ? minTakeitProbRaw
         : null;
 
     const db = getDb();
+
+    // The floor excludes NULL scores — right while a model exists, wrong when
+    // none is published: `NULL >= 0.70` is NULL and EVERY row drops. The feed
+    // endpoints got this guard in fa68e351; this sibling binds the identical
+    // predicate and was missed, so the strip/export went empty while the feed
+    // showed data. Probe only when a floor is on, then fail the floor OPEN.
+    // Spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+    const takeitCoverage =
+      requestedTakeitFloor == null
+        ? null
+        : await getTakeitCoverage(db, 'silent_boom', targetDate);
+    const takeitUnavailable = takeitCoverage?.unavailable === true;
+    const minTakeitProb = takeitUnavailable ? null : requestedTakeitFloor;
 
     // No LIMIT — export the full firehose. Order chronologically
     // forward so the spreadsheet reads top-to-bottom by bucket time.
@@ -195,6 +210,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           askPctBand: askPctBand ?? null,
           minTakeitProb,
         },
+        takeitUnavailable,
         rows: normalized,
       });
     }
@@ -203,6 +219,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // as a 404 in the browser.
     const tickerSuffix = tickerUpper ? `-${tickerUpper}` : '';
     const filename = `silent-boom-${targetDate}${tickerSuffix}.csv`;
+    // CSV has no body field for this, so the bypass is surfaced as a header.
+    if (takeitUnavailable) res.setHeader('X-Takeit-Unavailable', '1');
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Cache-Control', 'no-store');

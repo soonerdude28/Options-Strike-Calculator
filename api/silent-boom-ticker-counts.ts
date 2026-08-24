@@ -21,6 +21,7 @@ import {
   MIN_ALERT_ENTRY_PRICE,
 } from './_lib/constants.js';
 import { sendDbErrorResponse } from './_lib/transient-db-response.js';
+import { getTakeitCoverage } from './_lib/takeit-availability.js';
 import {
   guardOwnerOrGuestEndpoint,
   setCacheHeaders,
@@ -40,6 +41,9 @@ interface CountRow {
 }
 
 interface SilentBoomTickerCountsResponse {
+  /** True when a floor was requested but nothing that day is scored, so the
+   *  floor was bypassed rather than silently emptying the result. */
+  takeitUnavailable: boolean;
   date: string;
   filters: {
     optionType: 'C' | 'P' | null;
@@ -117,7 +121,9 @@ export default async function handler(
   const dteHiBound = dteRange?.hi ?? 100_000;
   const minPremium =
     q.minPremium != null && q.minPremium > 0 ? q.minPremium : null;
-  const minTakeitProb =
+  // Raw request value; the EFFECTIVE floor is resolved once `db` exists,
+  // because a floor with no published model must fail open.
+  const requestedTakeitFloor =
     q.minTakeitProb != null && q.minTakeitProb > 0 ? q.minTakeitProb : null;
   const hideLatePm = q.hideLatePm === true;
 
@@ -148,6 +154,19 @@ export default async function handler(
 
   try {
     const db = getDb();
+
+    // The floor excludes NULL scores — right while a model exists, wrong when
+    // none is published: `NULL >= 0.70` is NULL and EVERY row drops. The feed
+    // endpoints got this guard in fa68e351; this sibling binds the identical
+    // predicate and was missed, so the strip/export went empty while the feed
+    // showed data. Probe only when a floor is on, then fail the floor OPEN.
+    // Spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+    const takeitCoverage =
+      requestedTakeitFloor == null
+        ? null
+        : await getTakeitCoverage(db, 'silent_boom', date);
+    const takeitUnavailable = takeitCoverage?.unavailable === true;
+    const minTakeitProb = takeitUnavailable ? null : requestedTakeitFloor;
 
     const rows = (await withDbRetry(
       () => db`
@@ -218,6 +237,7 @@ export default async function handler(
         aggressivePremium,
         minTakeitProb,
       },
+      takeitUnavailable,
       tickers: rows.map((r) => ({
         ticker: r.ticker,
         count: r.count,

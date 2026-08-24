@@ -304,14 +304,18 @@ describe('lottery-finder-ticker-counts handler', () => {
     // the feed. Default UI value is 0.70 — the prior client-side
     // filter dropped 40+ of 50 fires per page and made pagination
     // meaningless.
-    mockSql.mockResolvedValueOnce([
-      {
-        ticker: 'NVDA',
-        count: 2,
-        peak_best_pct: '110.0',
-        latest_trigger_time_ct: '2026-05-14T15:00:00Z',
-      },
-    ]);
+    mockSql
+      // A floor makes the handler probe TAKE-IT coverage FIRST. Report the
+      // day as scored so the floor applies instead of failing open.
+      .mockResolvedValueOnce([{ total: 9, scored: 9 }])
+      .mockResolvedValueOnce([
+        {
+          ticker: 'NVDA',
+          count: 2,
+          peak_best_pct: '110.0',
+          latest_trigger_time_ct: '2026-05-14T15:00:00Z',
+        },
+      ]);
 
     const req = mockRequest({
       method: 'GET',
@@ -326,13 +330,14 @@ describe('lottery-finder-ticker-counts handler', () => {
     };
     expect(body.filters.minTakeitProb).toBe(0.7);
 
-    const sql = (mockSql.mock.calls[0]![0] as TemplateStringsArray).join(' ');
+    // calls[0] is the coverage probe; calls[1] is the ranked-CTE query.
+    const sql = (mockSql.mock.calls[1]![0] as TemplateStringsArray).join(' ');
     // Gates on the chain-level peak (chain_max_takeit), not the latest
     // fire's takeit_prob, so chip counts match the monotonic feed
     // (spec lottery-no-vanish-2026-05-29.md).
     expect(sql).toContain('chain_max_takeit >=');
     expect(sql).not.toContain('OR takeit_prob >=');
-    expect((mockSql.mock.calls[0] as unknown[]).slice(1)).toContain(0.7);
+    expect((mockSql.mock.calls[1] as unknown[]).slice(1)).toContain(0.7);
   });
 
   it('omits minTakeitProb from filters echo when not provided', async () => {
@@ -619,6 +624,59 @@ describe('lottery-finder-ticker-counts handler', () => {
     expect(res._json).toEqual({
       error: 'temporarily unavailable',
       transient: true,
+    });
+  });
+
+  // ── TAKE-IT floor fail-open ───────────────────────────────────────────────
+  // spec: docs/superpowers/specs/takeit-floor-fail-open-2026-08-23.md
+  // The feed endpoints got this guard in fa68e351; these siblings bind the
+  // IDENTICAL predicate and were missed, so with no model published the
+  // default 0.70 floor returned zero rows here while the feed showed data.
+  describe('TAKE-IT floor fail-open', () => {
+    it('bypasses the floor and flags it when nothing that day is scored', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 4371, scored: 0 }]) // coverage probe
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-14', minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      expect(res._status).toBe(200);
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(true);
+      expect(body.filters.minTakeitProb).toBeNull();
+      // The bypass is only real if the value reaches no query at all.
+      const bound = mockSql.mock.calls
+        .flatMap((c) => (c as unknown[]).slice(1))
+        .filter((v) => v === 0.7);
+      expect(bound).toHaveLength(0);
+    });
+
+    it('still filters normally when the day has at least one score', async () => {
+      mockSql
+        .mockResolvedValueOnce([{ total: 4371, scored: 9 }])
+        .mockResolvedValueOnce([]);
+
+      const req = mockRequest({
+        method: 'GET',
+        query: { date: '2026-05-14', minTakeitProb: '0.7' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+
+      const body = res._json as {
+        takeitUnavailable: boolean;
+        filters: { minTakeitProb: number | null };
+      };
+      expect(body.takeitUnavailable).toBe(false);
+      expect(body.filters.minTakeitProb).toBe(0.7);
     });
   });
 });

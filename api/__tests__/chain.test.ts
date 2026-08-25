@@ -42,6 +42,7 @@ function makeContract(
     totalVolume: number;
     openInterest: number;
     inTheMoney: boolean;
+    daysToExpiration: number;
   }> = {},
 ) {
   return {
@@ -60,7 +61,7 @@ function makeContract(
     theta: overrides.theta ?? -0.5,
     vega: overrides.vega ?? 0.1,
     volatility: overrides.volatility ?? 20.0, // 20% IV
-    daysToExpiration: 0,
+    daysToExpiration: overrides.daysToExpiration ?? 0,
     inTheMoney: overrides.inTheMoney ?? false,
     theoreticalValue: 1.75,
     expirationDate: '2026-03-14',
@@ -157,7 +158,7 @@ describe('GET /api/chain', () => {
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
-    expect(json.error).toContain('No 0DTE contracts found');
+    expect(json.error).toContain('No contracts found');
     expect(json.puts).toEqual([]);
     expect(json.calls).toEqual([]);
     expect(json.targetDeltas).toEqual({});
@@ -496,7 +497,7 @@ describe('GET /api/chain', () => {
 
     expect(res._status).toBe(200);
     const json = res._json as Record<string, unknown>;
-    expect(json.error).toContain('No 0DTE contracts found');
+    expect(json.error).toContain('No contracts found');
     expect(json.puts).toEqual([]);
     expect(json.calls).toEqual([]);
   });
@@ -536,5 +537,198 @@ describe('GET /api/chain', () => {
 
     const url = vi.mocked(schwabFetch).mock.calls[0]![0] as string;
     expect(url).toContain('strikeCount=80');
+  });
+});
+
+describe('GET /api/chain — arbitrary underlying', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    // restoreAllMocks does not reset call history on mocks created inside a
+    // vi.mock factory, and the 400 cases assert schwabFetch is never reached.
+    vi.mocked(schwabFetch).mockClear();
+    vi.mocked(guardOwnerOrGuestEndpoint).mockResolvedValue(false);
+    vi.mocked(isMarketOpen).mockReturnValue(true);
+  });
+
+  /** URL passed to the most recent schwabFetch call. */
+  const lastUrl = () => vi.mocked(schwabFetch).mock.calls.at(-1)![0] as string;
+
+  it('defaults to $SPX with a same-day expiry when no params are given', async () => {
+    vi.mocked(schwabFetch).mockResolvedValue({
+      ok: true,
+      data: makeSchwabChain(
+        [makeContract('PUT', 5600)],
+        [makeContract('CALL', 5800)],
+      ),
+    });
+
+    await handler(mockRequest({ method: 'GET' }), mockResponse());
+
+    const url = lastUrl();
+    expect(url).toContain(`symbol=${encodeURIComponent('$SPX')}`);
+    // fromDate === toDate is what makes the default a 0DTE chain
+    const from = /fromDate=(\d{4}-\d{2}-\d{2})/.exec(url)![1];
+    const to = /toDate=(\d{4}-\d{2}-\d{2})/.exec(url)![1];
+    expect(from).toBe(to);
+  });
+
+  it('forwards an equity symbol and explicit expiry to Schwab', async () => {
+    vi.mocked(schwabFetch).mockResolvedValue({
+      ok: true,
+      data: makeSchwabChain(
+        [makeContract('PUT', 21)],
+        [makeContract('CALL', 21.5)],
+      ),
+    });
+
+    await handler(
+      mockRequest({
+        method: 'GET',
+        query: { symbol: 'AG', expiry: '2026-08-28' },
+      }),
+      mockResponse(),
+    );
+
+    const url = lastUrl();
+    expect(url).toContain('symbol=AG');
+    expect(url).toContain('fromDate=2026-08-28');
+    expect(url).toContain('toDate=2026-08-28');
+  });
+
+  it('rejects a malformed symbol with 400 and never calls Schwab', async () => {
+    const res = mockResponse();
+    await handler(
+      mockRequest({ method: 'GET', query: { symbol: 'ag; DROP TABLE' } }),
+      res,
+    );
+
+    expect(res._status).toBe(400);
+    expect(schwabFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed expiry with 400', async () => {
+    const res = mockResponse();
+    await handler(
+      mockRequest({
+        method: 'GET',
+        query: { symbol: 'AG', expiry: '08/28/2026' },
+      }),
+      res,
+    );
+
+    expect(res._status).toBe(400);
+    expect(schwabFetch).not.toHaveBeenCalled();
+  });
+
+  it('drops a wide-spread strike by default (50% filter preserved)', async () => {
+    // bid 0.05 / ask 0.10 -> mid 0.075, spread is 67% of mid
+    vi.mocked(schwabFetch).mockResolvedValue({
+      ok: true,
+      data: makeSchwabChain(
+        [],
+        [makeContract('CALL', 3, { bid: 0.05, ask: 0.1, delta: 0.5 })],
+      ),
+    });
+
+    const res = mockResponse();
+    await handler(
+      mockRequest({
+        method: 'GET',
+        query: { symbol: 'RZLV', expiry: '2026-08-28' },
+      }),
+      res,
+    );
+
+    const json = res._json as Record<string, unknown>;
+    expect(json.calls).toHaveLength(0);
+  });
+
+  it('keeps a wide-spread strike when maxSpreadPct=0 disables the filter', async () => {
+    vi.mocked(schwabFetch).mockResolvedValue({
+      ok: true,
+      data: makeSchwabChain(
+        [],
+        [makeContract('CALL', 3, { bid: 0.05, ask: 0.1, delta: 0.5 })],
+      ),
+    });
+
+    const res = mockResponse();
+    await handler(
+      mockRequest({
+        method: 'GET',
+        query: { symbol: 'RZLV', expiry: '2026-08-28', maxSpreadPct: '0' },
+      }),
+      res,
+    );
+
+    const json = res._json as Record<string, unknown>;
+    const calls = json.calls as { bid: number; ask: number }[];
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.bid).toBe(0.05);
+    expect(calls[0]!.ask).toBe(0.1);
+  });
+
+  it('still drops a zero-bid strike even when maxSpreadPct=0', async () => {
+    vi.mocked(schwabFetch).mockResolvedValue({
+      ok: true,
+      data: makeSchwabChain(
+        [],
+        [makeContract('CALL', 3, { bid: 0, ask: 0.05, delta: 0.4 })],
+      ),
+    });
+
+    const res = mockResponse();
+    await handler(
+      mockRequest({
+        method: 'GET',
+        query: { symbol: 'RZLV', maxSpreadPct: '0' },
+      }),
+      res,
+    );
+
+    const json = res._json as Record<string, unknown>;
+    expect(json.calls).toHaveLength(0);
+  });
+
+  it('reports daysToExpiration from the contracts, not a hard-coded 0', async () => {
+    vi.mocked(schwabFetch).mockResolvedValue({
+      ok: true,
+      data: makeSchwabChain(
+        [makeContract('PUT', 48, { daysToExpiration: 3 })],
+        [makeContract('CALL', 49, { daysToExpiration: 3 })],
+      ),
+    });
+
+    const res = mockResponse();
+    await handler(
+      mockRequest({
+        method: 'GET',
+        query: { symbol: 'BSX', expiry: '2026-08-28' },
+      }),
+      res,
+    );
+
+    const json = res._json as Record<string, unknown>;
+    expect(json.daysToExpiration).toBe(3);
+  });
+
+  it('names the requested symbol and expiry in the empty-chain message', async () => {
+    vi.mocked(schwabFetch).mockResolvedValue({
+      ok: true,
+      data: makeSchwabChain([], []),
+    });
+
+    const res = mockResponse();
+    await handler(
+      mockRequest({
+        method: 'GET',
+        query: { symbol: 'AG', expiry: '2026-08-28' },
+      }),
+      res,
+    );
+
+    const json = res._json as Record<string, unknown>;
+    expect(json.error).toContain('AG');
+    expect(json.error).toContain('2026-08-28');
   });
 });

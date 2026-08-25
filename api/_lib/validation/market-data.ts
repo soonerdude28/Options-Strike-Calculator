@@ -424,3 +424,43 @@ export const gexbotQuerySchema = z
   });
 
 export type GexbotQuery = z.infer<typeof gexbotQuerySchema>;
+
+// ============================================================
+// /api/chain
+// ============================================================
+
+/**
+ * Query params for GET /api/chain.
+ *
+ * Originally SPX-0DTE-only; now serves any optionable underlying so the
+ * same broker-computed greeks are available for equity positions.
+ *
+ * - `symbol` defaults to '$SPX' (preserves the original behaviour). The
+ *   leading `$` is Schwab's index prefix, so it is allowed but optional.
+ * - `expiry` defaults to ET-today, which is what makes the default a 0DTE
+ *   SPX chain. Supply it to pull any other expiration.
+ * - `strikeCount` is the number of strikes around ATM (Schwab caps this).
+ * - `maxSpreadPct` is the stale-quote filter: a strike is dropped when its
+ *   bid/ask spread exceeds this percentage of mid. Defaults to 50 to match
+ *   the original hard-coded filter. Set to 0 to disable it — necessary for
+ *   thin equity contracts, where a wide spread is the real market rather
+ *   than a stale quote, and silently dropping those strikes hides the
+ *   position the caller is asking about.
+ */
+export const chainQuerySchema = z.object({
+  symbol: z
+    .string()
+    .regex(
+      /^\$?[A-Z]{1,8}$/,
+      'symbol must be 1-8 uppercase letters, optionally $-prefixed',
+    )
+    .optional(),
+  expiry: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'expiry must be YYYY-MM-DD')
+    .optional(),
+  strikeCount: z.coerce.number().int().min(1).max(500).optional(),
+  maxSpreadPct: z.coerce.number().min(0).max(1000).optional(),
+});
+
+export type ChainQuery = z.infer<typeof chainQuerySchema>;

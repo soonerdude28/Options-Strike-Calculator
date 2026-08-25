@@ -89,12 +89,21 @@ const SUMMABLE = [
 
 export type SummableField = (typeof SUMMABLE)[number];
 
+/**
+ * The three fields the collision rule needs, and nothing more.
+ *
+ * Deliberately no index signature. An interface without one is not assignable
+ * to a type that has one, so requiring `[field: string]: unknown` here would
+ * reject every caller whose row type is a plain interface — which is all of
+ * them, and which the production build catches even though a bare
+ * `tsc --noEmit` on the root config does not. The greek columns are read
+ * through one narrow cast below instead of being pushed into every caller's
+ * type.
+ */
 export interface StrikeKeyed {
   date: string;
   expiry: string;
   strike: string;
-  dte?: number;
-  [field: string]: unknown;
 }
 
 export interface Collision {
@@ -136,6 +145,10 @@ export class DuplicateStrikeRowsError extends Error {
 
 const keyOf = (r: StrikeKeyed) => `${r.date}|${r.expiry}|${r.strike}`;
 
+/** Read a greek column off a row whose type does not declare an index. */
+const fieldOf = (row: StrikeKeyed, field: string): unknown =>
+  (row as unknown as Record<string, unknown>)[field];
+
 const num = (v: unknown): number => {
   const n = Number.parseFloat(String(v ?? ''));
   return Number.isFinite(n) ? n : 0;
@@ -168,7 +181,9 @@ export function dedupeStrikeRows<T extends StrikeKeyed>(
     if (group.length < 2) continue;
     const first = group[0]!;
     const identical = group.every((r) =>
-      SUMMABLE.every((f) => String(r[f] ?? '') === String(first[f] ?? '')),
+      SUMMABLE.every(
+        (f) => String(fieldOf(r, f) ?? '') === String(fieldOf(first, f) ?? ''),
+      ),
     );
     collisions.push({
       date: first.date,
@@ -190,10 +205,12 @@ export function dedupeStrikeRows<T extends StrikeKeyed>(
       out.push({ ...first, source_rows: 1 });
       continue;
     }
-    const combined: Record<string, unknown> = { ...first };
+    const combined: Record<string, unknown> = {
+      ...(first as unknown as Record<string, unknown>),
+    };
     for (const field of SUMMABLE) {
       combined[field] = group
-        .reduce((sum, r) => sum + num(r[field]), 0)
+        .reduce((sum, r) => sum + num(fieldOf(r, field)), 0)
         .toString();
     }
     out.push({ ...(combined as T), source_rows: group.length });

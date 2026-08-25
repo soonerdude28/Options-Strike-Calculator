@@ -41,6 +41,7 @@ import {
   guardOwnerOrGuestEndpoint,
 } from './_lib/api-helpers.js';
 import { withRequestScope } from './_lib/request-scope.js';
+import { chainQuerySchema } from './_lib/validation.js';
 import { getETDateStr } from '../src/utils/timezone.js';
 
 // ============================================================
@@ -212,18 +213,42 @@ function findCallForDelta(
 
 const TARGET_DELTAS = [5, 8, 10, 12, 15, 20];
 
+/** Schwab's index prefix; the endpoint's original hard-coded underlying. */
+const DEFAULT_SYMBOL = '$SPX';
+
+/**
+ * Drop a strike when its bid/ask spread exceeds this percentage of mid.
+ * 50 reproduces the original hard-coded stale-quote filter. Callers pulling
+ * thin equity chains should pass maxSpreadPct=0 to disable it — there a wide
+ * spread is the real market, not a stale quote.
+ */
+const DEFAULT_MAX_SPREAD_PCT = 50;
+
 export default withRequestScope('GET', '/api/chain', async (req, res, done) => {
   try {
     if (await guardOwnerOrGuestEndpoint(req, res, done)) return;
 
-    const today = getTodayET();
-    const strikeCount = Number(req.query.strikeCount) || 80;
+    const parsed = chainQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      done({ status: 400, error: 'validation' });
+      return res.status(400).json({
+        error: 'Invalid query params',
+        details: parsed.error.issues.map((i) => i.message),
+      });
+    }
 
-    // Schwab uses $SPX for SPX options (SPXW weeklies for 0DTE)
+    const today = getTodayET();
+    const symbol = parsed.data.symbol ?? DEFAULT_SYMBOL;
+    // Default expiry = today, which is what makes the default a 0DTE SPX chain.
+    const expiry = parsed.data.expiry ?? today;
+    const strikeCount = parsed.data.strikeCount ?? 80;
+    const maxSpreadPct = parsed.data.maxSpreadPct ?? DEFAULT_MAX_SPREAD_PCT;
+
+    // Schwab uses a $ prefix for index options ($SPX -> SPXW weeklies for 0DTE).
     // range=ALL to avoid missing strikes near ATM on fast-moving days
     const result = await schwabFetch<SchwabChainResponse>(
-      `/chains?symbol=$SPX&contractType=ALL&includeUnderlyingQuote=true` +
-        `&strategy=SINGLE&range=ALL&fromDate=${today}&toDate=${today}` +
+      `/chains?symbol=${encodeURIComponent(symbol)}&contractType=ALL&includeUnderlyingQuote=true` +
+        `&strategy=SINGLE&range=ALL&fromDate=${expiry}&toDate=${expiry}` +
         `&strikeCount=${strikeCount}`,
     );
 
@@ -240,7 +265,8 @@ export default withRequestScope('GET', '/api/chain', async (req, res, done) => {
       done({ status: 200 });
       return res.status(200).json({
         error:
-          'No 0DTE contracts found. Market may be closed or chain not yet available.',
+          `No contracts found for ${symbol} expiring ${expiry}. ` +
+          'Market may be closed or the chain is not yet available.',
         underlying: chain.underlying
           ? {
               symbol: chain.underlying.symbol,
@@ -256,7 +282,10 @@ export default withRequestScope('GET', '/api/chain', async (req, res, done) => {
     }
 
     done({ status: 200 });
-    return buildResponse(res, chain, rawPuts, rawCalls, today);
+    return buildResponse(res, chain, rawPuts, rawCalls, expiry, {
+      symbol,
+      maxSpreadPct,
+    });
   } catch (error) {
     done({ status: 500, error: 'unhandled' });
     Sentry.captureException(error);
@@ -347,11 +376,16 @@ function buildResponse(
   rawPuts: SchwabOptionContract[],
   rawCalls: SchwabOptionContract[],
   today: string,
+  opts: { symbol: string; maxSpreadPct: number },
 ) {
-  // Filter stale quotes: bid=0 or extremely wide spread (>50% of mid)
+  // Filter stale quotes: bid=0, or a spread wider than maxSpreadPct of mid.
+  // maxSpreadPct=0 disables the spread test entirely (thin equity chains),
+  // but a zero bid is always dropped — there is no exit at a zero bid.
+  const spreadLimit = opts.maxSpreadPct / 100;
   const isLiveQuote = (s: ChainStrike): boolean => {
     if (s.bid <= 0) return false;
-    if (s.mid > 0 && (s.ask - s.bid) / s.mid > 0.5) return false;
+    if (spreadLimit > 0 && s.mid > 0 && (s.ask - s.bid) / s.mid > spreadLimit)
+      return false;
     return true;
   };
 
@@ -402,14 +436,19 @@ function buildResponse(
   const open = isMarketOpen();
   setCacheHeaders(res, open ? 30 : 300, open ? 15 : 60);
 
+  // Read DTE off the contracts rather than assuming 0 — the endpoint no
+  // longer serves only same-day SPX expiries.
+  const dte =
+    rawCalls[0]?.daysToExpiration ?? rawPuts[0]?.daysToExpiration ?? 0;
+
   return res.status(200).json({
     underlying: {
-      symbol: chain.underlying?.symbol ?? '$SPX',
+      symbol: chain.underlying?.symbol ?? opts.symbol,
       price: chain.underlying?.last ?? 0,
       prevClose: chain.underlying?.close ?? 0,
     },
     expirationDate: expDate,
-    daysToExpiration: 0,
+    daysToExpiration: dte,
     contractCount: puts.length + calls.length,
     puts,
     calls,

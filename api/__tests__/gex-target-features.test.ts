@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 const mockQuery = vi.fn();
 const mockSql = vi.fn() as ReturnType<typeof vi.fn> & {
@@ -532,5 +533,36 @@ describe('writeFeatureRows', () => {
     // No negative wall on any strike — both neg slots must be null
     expect(p[29]).toBeNull();
     expect(p[30]).toBeNull();
+  });
+});
+
+describe('untrusted per-strike rows are excluded from the join', () => {
+  // The file itself warns that its two SELECT branches "MUST stay in sync",
+  // and the SQL cannot be shared as a fragment because the test mock does not
+  // implement sql.unsafe. So the guard against drift is this assertion rather
+  // than a shared constant: if someone adds the predicate to one branch and
+  // not the other, the bulk and single-snapshot paths would silently disagree
+  // about which rows are trustworthy.
+  const source = readFileSync(
+    new URL('../_lib/gex-target-features.ts', import.meta.url),
+    'utf8',
+  );
+
+  it('carries the trust predicate in BOTH join branches', () => {
+    const joins = source.match(/LEFT JOIN greek_exposure_strike ges/g) ?? [];
+    const guards = source.match(/COALESCE\(ges\.spec_version, 0\) >= 2/g) ?? [];
+    expect(joins).toHaveLength(2);
+    expect(guards).toHaveLength(joins.length);
+  });
+
+  it('spells the OPEX test out, since Postgres has no third-Friday function', () => {
+    const opexTests =
+      source.match(/EXTRACT\(DAY FROM ges\.expiry\) BETWEEN 15 AND 21/g) ?? [];
+    expect(opexTests).toHaveLength(2);
+  });
+
+  it('keeps the join LEFT so a filtered row nulls columns instead of dropping features', () => {
+    // The gtf row must survive: only the display-only ges.* columns go NULL.
+    expect(source).not.toMatch(/INNER JOIN greek_exposure_strike/);
   });
 });

@@ -945,6 +945,38 @@ export async function loadStrikeScoreHistory(
         ON  ges.date   = gtf.date
         AND ges.expiry = gtf.date
         AND ges.strike::numeric = gtf.strike::numeric
+      -- Untrusted rows join to nothing, so the five ges.* columns come back
+      -- NULL rather than carrying half a chain. They are display-only, and a
+      -- missing number is honest where a halved one is not. The rule is
+      -- isTrustedStrikeRow / TRUSTED_STRIKE_ROW_SQL in
+      -- ./gex-strike-integrity.ts: a row written before spec 2 whose expiry is
+      -- a monthly OPEX lost one settlement series to the vendor's
+      -- undiscriminated AM/PM merge. Inlined rather than interpolated because
+      -- the test mock does not implement sql.unsafe; the sibling branch carries
+      -- the identical predicate and gex-target-features.test.ts asserts both.
+      AND (
+        COALESCE(ges.spec_version, 0) >= 2
+        OR NOT (
+          EXTRACT(ISODOW FROM ges.expiry) = 5
+          AND EXTRACT(DAY FROM ges.expiry) BETWEEN 15 AND 21
+        )
+      )
+        -- Untrusted rows join to nothing, so the five ges.* columns come back
+        -- NULL rather than carrying half a chain. They are display-only, and a
+        -- missing number is honest where a halved one is not. The rule is
+        -- isTrustedStrikeRow / TRUSTED_STRIKE_ROW_SQL in
+        -- ./gex-strike-integrity.ts: a row written before spec 2 whose expiry is
+        -- a monthly OPEX lost one settlement series to the vendor's
+        -- undiscriminated AM/PM merge. Inlined rather than interpolated because
+        -- the test mock does not implement sql.unsafe; the sibling branch carries
+        -- the identical predicate and gex-target-features.test.ts asserts both.
+        AND (
+          COALESCE(ges.spec_version, 0) >= 2
+          OR NOT (
+            EXTRACT(ISODOW FROM ges.expiry) = 5
+            AND EXTRACT(DAY FROM ges.expiry) BETWEEN 15 AND 21
+          )
+        )
       WHERE gtf.date = ${date}
       ORDER BY gtf.timestamp ASC, gtf.mode ASC, gtf.strike ASC
     `,

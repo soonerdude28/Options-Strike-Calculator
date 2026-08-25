@@ -6,6 +6,14 @@
  *
  * For 0DTE backfill: date=expiry=<trading_date>, so dte=0 for all rows.
  *
+ * Walks history, so it meets the monthly-OPEX collision on every third Friday
+ * it touches: UW merges the AM- and PM-settled series with no discriminator,
+ * and `ON CONFLICT (date, expiry, strike) DO UPDATE` used to keep whichever
+ * arrived last. The same failure was found independently in the Periscope
+ * backfill, which measured it at 35 of 760 days. Rows are deduped by the same
+ * named rule the cron uses — see api/_lib/gex-strike-integrity.ts — so a
+ * re-run repairs those days rather than re-inflicting the loss on them.
+ *
  * Usage:
  *   UW_API_KEY=your_key DATABASE_URL="postgresql://..." node scripts/backfill-greek-exposure-strike.mjs
  *   UW_API_KEY=your_key DATABASE_URL="postgresql://..." node scripts/backfill-greek-exposure-strike.mjs 5
@@ -13,7 +21,15 @@
 
 import { neon } from '@neondatabase/serverless';
 
+import {
+  GEX_STRIKE_SPEC_VERSION,
+  dedupeStrikeRows,
+  isOpexExpiry,
+} from '../api/_lib/gex-strike-integrity.ts';
 import { getTradingDays } from './_lib/trading-days.mjs';
+
+/** Recorded on every row so a backfilled value is attributable to a build. */
+const SOURCE_COMMIT = process.env.SOURCE_COMMIT ?? 'backfill-script';
 
 const UW_API_KEY = process.env.UW_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -55,13 +71,30 @@ async function fetchStrikeExpiry(date, counters) {
 
 // ── Store strike rows for a date ────────────────────────────
 
-async function storeStrikeRows(rows, date, counters) {
+async function storeStrikeRows(rawRows, date, counters) {
   let stored = 0;
 
-  for (const row of rows) {
-    // Filter out zero-GEX rows
-    if (row.call_gex === '0.0000' && row.put_gex === '0.0000') continue;
+  // Drop zero-GEX strikes first, then collapse the AM/PM collision with the
+  // same rule the cron runs under. Doing it in this order matters: a zero row
+  // summed into a real one would change nothing but would inflate source_rows
+  // and make a clean strike look collided.
+  const filtered = rawRows.filter(
+    (r) => !(r.call_gex === '0.0000' && r.put_gex === '0.0000'),
+  );
+  const { rows, collisions, rule } = dedupeStrikeRows(
+    filtered.map((r) => ({ ...r, date, expiry: date })),
+  );
+  if (collisions.length > 0) {
+    const differing = collisions.filter((c) => !c.identical).length;
+    console.warn(
+      `  ${date}: ${collisions.length} duplicate (expiry, strike) key(s) ` +
+        `(${differing} with differing greeks) combined by rule '${rule}'` +
+        (isOpexExpiry(date) ? ' — monthly OPEX' : ''),
+    );
+    counters.collisions = (counters.collisions ?? 0) + collisions.length;
+  }
 
+  for (const row of rows) {
     // Layer 2 computed columns
     const callGex = Number.parseFloat(row.call_gex);
     const putGex = Number.parseFloat(row.put_gex);
@@ -84,7 +117,8 @@ async function storeStrikeRows(rows, date, counters) {
           call_charm, put_charm,
           call_vanna, put_vanna,
           net_gex, net_delta, net_charm, net_vanna,
-          abs_gex, call_gex_fraction
+          abs_gex, call_gex_fraction,
+          underlying, source_rows, dedupe_rule, spec_version, source_commit
         )
         VALUES (
           ${date}, ${date}, ${row.strike}, 0,
@@ -93,9 +127,16 @@ async function storeStrikeRows(rows, date, counters) {
           ${row.call_charm}, ${row.put_charm},
           ${row.call_vanna}, ${row.put_vanna},
           ${netGex}, ${netDelta}, ${netCharm}, ${netVanna},
-          ${absGex}, ${callGexFraction}
+          ${absGex}, ${callGexFraction},
+          'SPX', ${row.source_rows}, ${rule},
+          ${GEX_STRIKE_SPEC_VERSION}, ${SOURCE_COMMIT}
         )
         ON CONFLICT (date, expiry, strike) DO UPDATE SET
+          underlying = EXCLUDED.underlying,
+          source_rows = EXCLUDED.source_rows,
+          dedupe_rule = EXCLUDED.dedupe_rule,
+          spec_version = EXCLUDED.spec_version,
+          source_commit = EXCLUDED.source_commit,
           dte = EXCLUDED.dte,
           call_gex = EXCLUDED.call_gex,
           put_gex = EXCLUDED.put_gex,

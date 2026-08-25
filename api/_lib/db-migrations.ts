@@ -5350,4 +5350,30 @@ export const MIGRATIONS: Migration[] = [
       `,
     ],
   },
+  {
+    id: 194,
+    description:
+      "Per-strike greek exposure: provenance columns and a spec version, after finding that monthly OPEX silently overwrote half the chain. UW's greek-exposure/strike-expiry returns the AM-settled and PM-settled series for a monthly expiry merged into one array with no discriminator field (UW staff confirmed 2026-08-21; reproduced live 2026-08-25, where date=2026-08-21 returned 1090 rows carrying 590 unique (expiry, strike) keys, 500 duplicated and 293 of those with different greeks, while the neighbouring non-OPEX session was perfectly unique). greek_exposure_strike is keyed UNIQUE (date, expiry, strike) and fetch-greek-exposure-strike upserts with ON CONFLICT DO UPDATE, so one series per collided strike was discarded, silently, on roughly twelve sessions a year — every one of them a monthly OPEX, which are the highest-gamma days of the month. This migration does NOT change the key: the vendor sends nothing that could disambiguate the two series, so a wider key would only invent a distinction the data does not carry. It adds the columns that make the resolution auditable instead — source_rows (how many vendor rows were combined into this one), dedupe_rule (which named rule did it), observed_at / calculated_at (fetch and computation instants, neither of which the vendor supplies), spot and spot_observed_at with spot_freshness (because staff also confirmed on 2026-08-21 that premarket gamma for SPX and VIX is computed against a stale spot, and greek-exposure/strike-expiry carries no spot or timestamp at all to check it against), and spec_version / source_commit so a row can be attributed to the code that produced it. Existing rows keep spec_version IS NULL, which is the invalidation: they were written by the faulty version and research code filters them out rather than mixing them in. Nothing is deleted and nothing is rewritten — the historical rows are still the vendor's own published figures, they simply cannot be trusted on OPEX dates. Additive columns only; reverse by dropping them.",
+    statements: (sql) => [
+      sql`
+        ALTER TABLE greek_exposure_strike
+          ADD COLUMN IF NOT EXISTS underlying       TEXT NOT NULL DEFAULT 'SPX',
+          ADD COLUMN IF NOT EXISTS source_rows      INTEGER,
+          ADD COLUMN IF NOT EXISTS dedupe_rule      TEXT,
+          ADD COLUMN IF NOT EXISTS observed_at      TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS calculated_at    TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS spot             NUMERIC(12,4),
+          ADD COLUMN IF NOT EXISTS spot_observed_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS spot_freshness   TEXT,
+          ADD COLUMN IF NOT EXISTS spec_version     INTEGER,
+          ADD COLUMN IF NOT EXISTS source_commit    TEXT
+      `,
+      // Research reads filter on this; without it every query pays a seq scan
+      // to exclude the faulty-version rows.
+      sql`
+        CREATE INDEX IF NOT EXISTS idx_greek_exposure_strike_spec_version
+          ON greek_exposure_strike (spec_version)
+      `,
+    ],
+  },
 ];

@@ -783,8 +783,16 @@ export default withCronInstrumentation(
         const cacheKey = `${rec.underlyingSymbol}_${rec.date}`;
         let candles = candleCache.get(cacheKey);
         if (candles == null) {
+          // Source the key here, NOT from ctx.apiKey. This cron declares
+          // `requireApiKey: false` (below), and cron-helpers.ts:221 then
+          // hardcodes ctx.apiKey to '' — so every call 401'd and range_pos was
+          // NULL on all 20,698 fires. Flipping the flag to true is the wrong
+          // fix: guardCron 500s the whole cron when the key is missing, and
+          // this cron's actual job (detecting fires from ws_option_trades)
+          // needs no UW at all. range_pos is display-only, so it must degrade
+          // on its own without taking fire detection down with it.
           candles = await fetchStockCandles1m(
-            ctx.apiKey,
+            process.env.UW_API_KEY ?? '',
             rec.underlyingSymbol,
             rec.date,
           );

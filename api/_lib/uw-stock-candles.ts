@@ -10,6 +10,7 @@
  */
 
 import { uwFetch } from './api-helpers.js';
+import logger from './logger.js';
 
 export interface UWStockCandle {
   /** ISO timestamp at the start of the 1-min bucket. */
@@ -22,21 +23,44 @@ export interface UWStockCandle {
 }
 
 /**
- * Fetch 1-min OHLC for one stock × date. Returns [] on UW failure
- * (logged by uwFetch) — callers should treat empty as "no data; skip
- * range_pos computation, leave column NULL on the row".
+ * Fetch 1-min OHLC for one stock × date.
+ *
+ * Fails OPEN — returns [] so a UW outage can never break fire detection, and
+ * callers treat empty as "no data; leave range_pos NULL on the row". But it
+ * fails LOUDLY: the previous `catch { return [] }` swallowed everything, and
+ * uwFetch only logs/metrics 429s — a 401 is thrown, not logged. That combination
+ * hid a total outage: detect-lottery-fires passed ctx.apiKey, which is hardcoded
+ * `''` under `requireApiKey: false` (cron-helpers.ts:221), so every call 401'd
+ * and range_pos_at_trigger was NULL on 20,698 of 20,698 fires with no log, no
+ * Sentry event and no failing cron.
+ *
+ * The empty-key check is not just defensive. uwFetch calls acquireUWSlot()
+ * BEFORE issuing the request, so a request that can only 401 still consumes
+ * shared UW rate-limit budget against the 115/min cap. Never spend a slot on a
+ * call that cannot succeed.
  */
 export async function fetchStockCandles1m(
   apiKey: string,
   ticker: string,
   date: string,
 ): Promise<UWStockCandle[]> {
+  if (!apiKey) {
+    logger.warn(
+      { ticker, date },
+      'fetchStockCandles1m: no UW API key — skipping request, range_pos stays null',
+    );
+    return [];
+  }
   try {
     return await uwFetch<UWStockCandle>(
       apiKey,
       `/stock/${ticker}/ohlc/1m?date=${date}`,
     );
-  } catch {
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, ticker, date },
+      'fetchStockCandles1m: UW fetch failed — range_pos stays null',
+    );
     return [];
   }
 }

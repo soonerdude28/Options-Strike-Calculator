@@ -69,6 +69,36 @@ interface FlowRow {
   created_at: string | Date;
 }
 
+/**
+ * What the driver actually hands back. flow_data.ncp/npp are NUMERIC, and the
+ * Neon serverless driver returns NUMERIC as a STRING ("-800000000.00").
+ */
+interface RawFlowRow extends Omit<FlowRow, 'ncp' | 'npp'> {
+  ncp: number | string;
+  npp: number | string;
+}
+
+/**
+ * Coerce NUMERIC-as-string at the boundary so `FlowRow.ncp` is genuinely a
+ * number downstream.
+ *
+ * Casting raw rows with `as FlowRow[]` was a type lie: tsc saw `number` while
+ * the values were strings, so `ncp < npp` compared LEXICOGRAPHICALLY —
+ * "-800000000.00" < "-200000000.00" is false where -800M < -200M is true.
+ * Measured on production flow_data, 1,216 of 5,668 rows (21.5%) flip
+ * direction, and this text feeds the Anthropic analyze prompt, so Claude was
+ * told bullish when the tape was bearish and vice versa.
+ *
+ * `Math.abs(a.ncp - a.npp)` was never affected — `-` coerces. Only `<` between
+ * two strings goes lexicographic, which is why the damage was confined to the
+ * direction flags. Coercing here rather than patching each `<` keeps the next
+ * reader of FlowRow safe. Mirrors db-flow.ts:64, which is clean for this
+ * reason.
+ */
+function toFlowRow(r: RawFlowRow): FlowRow {
+  return { ...r, ncp: Number(r.ncp), npp: Number(r.npp) };
+}
+
 interface TideArc {
   open: FlowRow;
   midday: FlowRow;
@@ -422,13 +452,14 @@ export async function formatPriorDayFlowForClaude(
         WHERE date = ${date}
           AND source = 'market_tide'
         ORDER BY created_at ASC
-      `) as FlowRow[];
+      `) as RawFlowRow[];
+      const tideRowsNum = tideRows.map(toFlowRow);
 
       let tideArc: TideArc | null = null;
-      if (tideRows.length > 0) {
-        const openRow = tideRows[0]!;
-        const closeRow = tideRows.at(-1)!;
-        const middayRow = findMiddayRow(tideRows);
+      if (tideRowsNum.length > 0) {
+        const openRow = tideRowsNum[0]!;
+        const closeRow = tideRowsNum.at(-1)!;
+        const middayRow = findMiddayRow(tideRowsNum);
         tideArc = { open: openRow, midday: middayRow, close: closeRow };
       }
 
@@ -438,11 +469,12 @@ export async function formatPriorDayFlowForClaude(
         WHERE date = ${date}
           AND source = ANY(${SECONDARY_FLOW_SOURCES as unknown as string[]})
         ORDER BY source, created_at DESC
-      `) as FlowRow[];
+      `) as RawFlowRow[];
 
       const secondarySources: Partial<Record<SecondaryFlowSource, FlowRow>> =
         {};
-      for (const row of secRows) {
+      for (const raw of secRows) {
+        const row = toFlowRow(raw);
         if (
           SECONDARY_FLOW_SOURCES.includes(row.source as SecondaryFlowSource)
         ) {

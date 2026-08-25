@@ -1190,6 +1190,52 @@ describe('formatPriorDayFlowForClaude', () => {
     created_at: new Date(`${date}T${String(utcHour).padStart(2, '0')}:00:00Z`),
   });
 
+  // ── NUMERIC-as-string ────────────────────────────────────────────────────
+  // flow_data.ncp/npp are NUMERIC, which the Neon serverless driver returns as
+  // STRINGS ("-800000000.00"). FlowRow declares them `number`, so tsc is happy
+  // while `ncp < npp` compares LEXICOGRAPHICALLY: "-8..." < "-2..." is false
+  // where -800M < -200M is true. Measured on production flow_data, 1,216 of
+  // 5,668 rows (21.5%) flip direction — and this text goes into the Anthropic
+  // analyze prompt, so Claude is told bullish when the tape was bearish.
+  //
+  // Note `Math.abs(a.ncp - a.npp)` is unaffected: `-` coerces. Only `<`
+  // between two strings goes lexicographic, so the bug is exactly the five
+  // comparison sites. Every other test here mocks ncp/npp as NUMBERS, which is
+  // why this shipped green — mirror production types instead.
+  const strRow = (
+    source: string,
+    ncp: string,
+    npp: string,
+    date: string,
+    utcHour: number,
+  ) => ({
+    source,
+    ncp: ncp as unknown as number,
+    npp: npp as unknown as number,
+    date,
+    created_at: new Date(`${date}T${String(utcHour).padStart(2, '0')}:00:00Z`),
+  });
+
+  it('reads direction numerically when the driver returns NUMERIC as strings', async () => {
+    // Every row is bullish numerically (ncp far below npp) but reads bearish
+    // under a lexicographic compare.
+    const tideRows = [
+      strRow('market_tide', '-800000000.00', '-200000000.00', '2026-04-09', 14),
+      strRow('market_tide', '-900000000.00', '-300000000.00', '2026-04-09', 17),
+      // Close MUST be a pair that genuinely disagrees: "-8..." < "-2..." is
+      // false lexicographically but -850M < -250M is true. ("-1100000000.00"
+      // vs "-250000000.00" agrees under both and would not catch the bug.)
+      strRow('market_tide', '-850000000.00', '-250000000.00', '2026-04-09', 20),
+    ];
+    const sql = makeSql([[{ date: '2026-04-09' }], tideRows, []]);
+
+    const result = await formatPriorDayFlowForClaude(sql, '2026-04-10');
+
+    expect(result).not.toBeNull();
+    expect(result).toContain('bullish');
+    expect(result).not.toContain('bearish');
+  });
+
   it('returns null when no prior dates have market_tide data', async () => {
     const sql = makeSql([[]]); // empty dateRows
     const result = await formatPriorDayFlowForClaude(sql, '2026-04-10');

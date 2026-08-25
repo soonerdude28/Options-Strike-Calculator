@@ -5332,4 +5332,22 @@ export const MIGRATIONS: Migration[] = [
       `,
     ],
   },
+  {
+    id: 193,
+    description:
+      "Compress ws_option_trades.raw_payload. Measured on production: pg_column_size(raw_payload) averages 985 bytes against octet_length(raw_payload::text) of 880 — a ratio of 1.119, i.e. the JSONB is stored LARGER than its own text form and is not compressed at all. pg_column_compression() on a stored value returns NULL, and the table's TOAST relation is 8192 bytes (empty), confirming every value lives inline and uncompressed. The cause is not the storage mode (attstorage is already 'x'/EXTENDED, which permits compression) but toast_tuple_target: Postgres only attempts compression once a ROW exceeds it, the default is ~2048, and these rows average 1136 bytes — so the compressor never runs. raw_payload is 985 of those 1136 bytes (87%), across ~11.8M rows and a 13 GB heap. Three changes, all metadata-only and individually reversible: SET COMPRESSION lz4 (PostgreSQL 17.11, lz4 verified available on this Neon build; lz4 over pglz because these rows are read hot by detect-lottery-fires and detect-silent-boom, and lz4 decompresses several times faster); SET STORAGE MAIN so a compressed value is kept INLINE rather than pushed out-of-line into TOAST — this is the load-bearing choice, because those two crons read raw_payload->>'gamma' / 'trade_code' / 'nbbo_*' across 130-146k-row bucket scans, and turning each of those into a TOAST fetch would be a large regression against the wall budgets sized in c664d7f9 and 2b8a491c; and toast_tuple_target = 512 so the compressor actually engages on a ~1136-byte row. The expected effect is a net WIN for those same crons rather than a risk: more rows per 8KB page means their scans read proportionally fewer pages, against a heap cache-hit ratio currently measured at 83.99% (vs 98.11% on the table's own indexes) and 1.55 TB pulled from the pageserver. Nothing is rewritten by this migration — it applies to new rows only — but cleanup-ws-option-trades enforces RETENTION_DAYS = 2, so the table fully turns over within two days and the effect materialises without a VACUUM FULL. Storage saving is secondary and modest in dollars (Neon Launch bills $0.35/GB-month, so the projected ~7 GB is ~$2.50/month); the compute and cache-residency argument is the real motivation. Reverse with ALTER COLUMN raw_payload SET COMPRESSION pglz / SET STORAGE EXTENDED / ALTER TABLE ws_option_trades RESET (toast_tuple_target).",
+    statements: (sql) => [
+      sql`
+        ALTER TABLE ws_option_trades
+        ALTER COLUMN raw_payload SET COMPRESSION lz4
+      `,
+      sql`
+        ALTER TABLE ws_option_trades
+        ALTER COLUMN raw_payload SET STORAGE MAIN
+      `,
+      sql`
+        ALTER TABLE ws_option_trades SET (toast_tuple_target = 512)
+      `,
+    ],
+  },
 ];

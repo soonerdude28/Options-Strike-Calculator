@@ -209,4 +209,31 @@ describe('GET /api/periscope-lottery-feed', () => {
     // mock the guard so _json stays at its default null).
     expect(res._json).toBeNull();
   });
+
+  // ── BIGINT id must reach the wire as a NUMBER ────────────────────────────
+  // periscope_lottery_fires.id is BIGSERIAL, and the Neon driver returns
+  // BIGINT as a STRING ("344"). serializeFire emitted `id: r.id` raw — the one
+  // numeric field in it not routed through toNum() — so the wire carried
+  // {"id":"344"}. The client validator does
+  //   isFiniteNumber(v) => typeof v === 'number' && Number.isFinite(v)
+  // (src/hooks/usePeriscopeLotteryFeed.ts:57) and gates on !isFiniteNumber(r.id),
+  // so EVERY row failed validation and was dropped: 140 of 140 production fires
+  // discarded, panel showing "No fires today yet", no error and no Sentry event.
+  // Silently broken since 2ff0298e (2026-08-20) added that guard.
+  //
+  // Note the ROW fixture above mirrors production for every other NUMERIC
+  // column ('7362.1400', '-974008661.0000') and only `id: 1` was wrong — which
+  // is exactly why three separate test files missed this.
+  it('serializes a BIGINT id (string off the wire) as a number', async () => {
+    mockSql.mockResolvedValueOnce([{ ...ROW, id: '341' }]);
+
+    const req = mockRequest({ query: {} });
+    const res = mockResponse();
+    await handler(req, res);
+
+    const body = res._json as { fires: Array<{ id: unknown }> };
+    expect(body.fires).toHaveLength(1);
+    expect(typeof body.fires[0]!.id).toBe('number');
+    expect(body.fires[0]!.id).toBe(341);
+  });
 });

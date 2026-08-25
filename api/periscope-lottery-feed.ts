@@ -30,7 +30,10 @@ type DbTimestamp = string | Date;
 type DbFireType = 'call_lottery' | 'put_lottery';
 
 interface FireRow {
-  id: number;
+  /** BIGSERIAL — the Neon driver hands BIGINT back as a STRING ("344"), same
+   *  as every DbNumeric field below. Declaring it `number` was a lie tsc could
+   *  not see, and serializeFire then emitted it raw onto the wire. */
+  id: DbNumeric;
   fire_type: DbFireType;
   fire_time: DbTimestamp;
   expiry: string;
@@ -67,7 +70,7 @@ const toIso = (v: DbTimestamp | null): string | null =>
 
 function serializeFire(r: FireRow) {
   return {
-    id: r.id,
+    id: toNum(r.id)!,
     fireType: r.fire_type,
     fireTime: toIso(r.fire_time)!,
     expiry: r.expiry,

@@ -1,0 +1,69 @@
+{
+  "api/_lib/analyze-context-formatters.ts": {
+    "RawFlowRow": 2
+  },
+  "api/_lib/build-features-flow.ts": {
+    "FlowRow": 1
+  },
+  "api/_lib/build-features-gex.ts": {
+    "SpotRow": 1,
+    "GreekRow": 1,
+    "StrikeRow": 2
+  },
+  "api/_lib/build-features-monitor.ts": {
+    "IvRow": 1,
+    "RatioRow": 1
+  },
+  "api/_lib/dark-pool-query.ts": {
+    "PrintsRow": 4
+  },
+  "api/_lib/db-dealer-regime.ts": {
+    "RawRow": 4
+  },
+  "api/_lib/db-greek-flow.ts": {
+    "RawGreekFlowRow": 1
+  },
+  "api/_lib/db-pin-setup.ts": {
+    "RawStrikeRow": 1,
+    "RawTrajRow": 1,
+    "RawSettleRow": 1
+  },
+  "api/_lib/flow-regime-baseline-live.ts": {
+    "SlotPercentileRow": 1
+  },
+  "api/_lib/flow-regime-store.ts": {
+    "FlowRegimeSnapshotRow": 1
+  },
+  "api/_lib/microstructure-signals.ts": {
+    "OfiAggRow": 1,
+    "TobRow": 1
+  },
+  "api/_lib/multileg-classify-batch.ts": {
+    "WsOptionTradeRow": 1
+  },
+  "api/_lib/option-intraday.ts": {
+    "CachedRow": 1
+  },
+  "api/_lib/periscope-lottery-finder.ts": {
+    "SliceRow": 2,
+    "GexTargetRow": 1,
+    "FlowRow": 1
+  },
+  "api/_lib/periscope-synthesize.ts": {
+    "ConeLevelsRow": 1
+  },
+  "api/_lib/postgres-day-summary.ts": {
+    "DayAggregate": 1
+  },
+  "api/_lib/spx-candles.ts": {
+    "SPXCandleDbRow": 1
+  },
+  "api/_lib/uw-deltas.ts": {
+    "GexOpenNowRow": 1,
+    "WhaleAggRow": 1,
+    "TideEndpointsRow": 1
+  },
+  "api/periscope-lottery-feed.ts": {
+    "FireRow": 2
+  }
+}

@@ -168,6 +168,60 @@ Everything else gets the full loop.
 
 - **Auth is single-owner + optional guest keys** — one Schwab OAuth session via httpOnly cookie. Plaintext cookie is intentional. The owner can hand out comma-separated guest keys via `GUEST_ACCESS_KEYS`; guests get read-only access to owner-gated data endpoints (dark pool, GEX, TRACE Live, etc.) but **not** to the Anthropic-backed `api/analyze.ts`. See `api/_lib/guest-auth.ts` (`rejectIfNotOwnerOrGuest`, `guardOwnerOrGuestEndpoint`) and `src/utils/auth.ts` (`getAccessMode`).
 - **Neon Postgres** — `@neondatabase/serverless`, lazy singleton via `getDb()`. 91 tables managed by numbered migrations in `migrateDb()` (tracked in `schema_migrations`).
+
+#### NUMERIC and BIGINT come back as STRINGS — coerce at the boundary
+
+The Neon serverless driver returns Postgres `NUMERIC` and `BIGINT` as JS
+**strings** (`"-800000000.00"`, `"1"`). Casting a raw result to a type that
+declares those columns `number` is a lie `tsc` cannot see, and it has caused
+**four production bugs** in this repo:
+
+| commit                 | what happened                                                                                                                                                                           |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `2826ee4a`, `9954d585` | `SELECT id` (BIGINT → `"1"`) used as a JS **Map key** against an int4 from `unnest` (→ `1`). A Map does not coerce, so every lookup missed and 1,234 outcome rows were silently voided. |
+| `7e262c82`             | NUMERIC-as-string corrupted peak / minutes-to-peak.                                                                                                                                     |
+| `fcce72d6`             | `flow_data.ncp/npp` compared with `<`, which between two strings is **lexicographic**. 21.5% of production rows flipped Market Tide direction _inside the Anthropic analyze prompt_.    |
+
+**What is actually dangerous.** JS coerces for arithmetic but not for ordering
+or identity, which is why these bugs are subtle and partial:
+
+- ❌ `a < b`, `a > b` (string-vs-string is lexicographic), `a === b`,
+  `Map`/`Set` keys, `.sort()` default, `JSON.stringify` into an API response,
+  `Number.isFinite(x)`, `typeof x === 'number'`
+- ✅ `a - b`, `a * b`, `Math.abs(a - b)`, `+a`, and comparison against a **number
+  literal** (`"5" > 0` is `true` — one numeric operand forces coercion)
+
+So a value can be a string at runtime and be entirely harmless. Fix where it
+reaches an unsafe operation, not everywhere.
+
+**The convention.** Coerce once, at the query boundary, so the downstream type
+is honest — `db-flow.ts:64` and `analyze-context-formatters.ts` do this:
+
+```ts
+interface RawFooRow extends Omit<FooRow, 'ncp' | 'npp'> {
+  ncp: number | string;
+  npp: number | string;
+}
+const rows = ((await sql`...`) as RawFooRow[]).map(toFooRow);
+```
+
+Casting inside the SQL is equally good and often better — `x::float8`,
+`count(*)::int` come back as real numbers.
+
+**Enforcement.** `api/__tests__/sql-cast-ratchet.test.ts` counts bare
+`(await sql`…`) as SomeRow[]` assertions against
+`api/__tests__/sql-cast-allowlist.json` (39 grandfathered across 19 files) and
+fails on any increase. The allowlist does not assert those 39 are correct — it
+only stops the count from growing. When adding a genuinely-needed cast, add it
+to the allowlist and say why in the commit message.
+
+**Tests must mirror production types.** Every one of these bugs shipped green
+because the tests mocked the _declared_ type (numbers) instead of what the
+driver returns. When a fixture stands in for a NUMERIC/BIGINT column, make it a
+string — and pick values that actually distinguish the two comparisons
+(`"-1100000000.00" < "-250000000.00"` agrees with the numeric answer and proves
+nothing; `"-800000000.00" < "-200000000.00"` does not).
+
 - **Upstash Redis** — stores Schwab OAuth tokens (access + refresh). Env vars: `KV_REST_API_URL` / `UPSTASH_REDIS_REST_URL`.
 - **Input validation** — Zod schemas under `api/_lib/validation/` (`common`, `snapshot`, `market-data`, `lottery`, `periscope`, `tracker`, …) validate at system boundaries before data reaches Anthropic or Postgres. `api/_lib/validation.ts` is now just a barrel that `export *`s those files — add new schemas to the matching sub-file, not the barrel.
 - **Cron jobs** — 80 cron entries in `vercel.json` (some paths have several schedules), all verify `CRON_SECRET`. Market data fetches run every 1–5 min during market hours (13-21 UTC, Mon-Fri).

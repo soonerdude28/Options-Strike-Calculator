@@ -27,7 +27,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { waitUntil } from '@vercel/functions';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import logger from './logger.js';
-import { Sentry } from './sentry.js';
+import { metrics, Sentry } from './sentry.js';
 import { cronGuard } from './api-helpers.js';
 import { reportCronRun } from './axiom.js';
 import { SCHEDULE_MAP, type CronMonitorConfig } from './cron-schedules.js';
@@ -196,11 +196,25 @@ interface SentryCheckInInput {
  * until the HTTP request actually returns" — which is the entire
  * reason this bypass exists vs. the SDK's queue-and-flush dance.
  *
- * 5s timeout on the fetch so a slow Sentry can't stretch the function
- * beyond its budget. Even on `error` the cron itself still completes
- * — Sentry will only see the in_progress and fire a `maxRuntime`
- * alert, which is the failure mode we're trying to fix in the first
- * place; but better than blocking the response indefinitely.
+ * TRANSPORT failures (the fetch itself throws — ECONNRESET on a stale
+ * pooled connection, an abort-timeout) are retried up to 3 attempts
+ * total with a short jittered backoff, because a stale-pool reuse
+ * fails instantly and the retry rides a fresh connection (see the
+ * comment block above the fetch). An HTTP response of ANY status is a
+ * definitive answer from Sentry and is never retried — non-2xx is
+ * logged and swallowed as before. When every attempt throws, the loss
+ * is counted (`sentry.checkin.delivery_failed`) and logged, and the
+ * function still resolves with the checkInId.
+ *
+ * Per-attempt abort timeout: 5s on attempt 1 (the original contract —
+ * a slow Sentry can't stretch the function beyond its budget), 2s on
+ * attempts 2 and 3. Worst case is ~9s + backoffs vs. the old 5s, but
+ * the steady-state cost is unchanged: retries only happen after a
+ * throw, and the dominant throw (stale-conn reuse) fails in ~1ms.
+ * Even on a total delivery failure the cron itself still completes —
+ * Sentry will only see the in_progress and fire a `maxRuntime` alert,
+ * which is the failure mode we're trying to fix in the first place;
+ * but better than blocking the response indefinitely.
  */
 async function sentryCheckInDirect(input: SentryCheckInInput): Promise<string> {
   const checkInId = input.checkInId ?? randomUUID();
@@ -222,45 +236,110 @@ async function sentryCheckInDirect(input: SentryCheckInInput): Promise<string> {
     body.monitor_config = toMonitorConfigPayload(input.monitorConfig);
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
-  try {
-    // We deliberately use Node's default keep-alive pool here. Tried
-    // `Connection: close` in commit 62365e9e to eliminate stale-conn
-    // drops, but production showed the opposite: forcing a fresh TLS
-    // handshake per check-in produced ~100% miss rate (verified via
-    // Vercel runtime logs showing all handlers returning 200 while
-    // Sentry recorded "timeout check-in detected" every minute). Most
-    // likely Sentry's ingest edge throttles or RSTs unrecognized TLS
-    // sessions under burst. Keep-alive reuse is the lesser evil: the
-    // ~5% miss rate from stale-pool drops is silenced by the
-    // failureIssueThreshold: 3 policy in SCHEDULE_MAP.
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    // Sentry's Crons ingest returns 202 Accepted on success. A 4xx here
-    // typically means a bad DSN, project mismatch, or rate-limit; a 5xx
-    // means Sentry is down. Either way we still swallow (observability
-    // must never crash the response), but we log so the next "timeouts
-    // are firing again" investigation can immediately see whether the
-    // check-in itself was rejected vs. some other layer breaking.
-    if (!response.ok) {
-      logger.warn(
-        {
-          monitorSlug: input.monitorSlug,
-          status: input.status,
-          httpStatus: response.status,
-        },
-        'sentry check-in rejected',
+  // We deliberately use Node's default keep-alive pool here. Tried
+  // `Connection: close` in commit 62365e9e to eliminate stale-conn
+  // drops, but production showed the opposite: forcing a fresh TLS
+  // handshake per check-in produced ~100% miss rate (verified via
+  // Vercel runtime logs showing all handlers returning 200 while
+  // Sentry recorded "timeout check-in detected" every minute). Most
+  // likely Sentry's ingest edge throttles or RSTs unrecognized TLS
+  // sessions under burst. Keep-alive reuse stays — but the stale-pool
+  // drop it causes is no longer swallowed as a one-shot loss:
+  //
+  // 2026-08-26 DIAGNOSIS — the "~5% miss rate" estimate above was off
+  // by an order of magnitude at fleet size. Sentry's 14-day usage stats
+  // showed 103.3K cron check-ins ACCEPTED against a fleet that emits
+  // ~20K/day (62 monitors, 15 every-minute pairs) — only ~7.4K/day
+  // arriving, i.e. roughly TWO-THIRDS of check-in POSTs never reached
+  // Sentry, with near-zero rate-limited (46) and invalid (28) counts.
+  // Vercel runtime logs showed every cron handler returning 200 on
+  // schedule. So the loss point was exactly here: the single fetch
+  // attempt over a pooled connection that Fluid Compute let go stale
+  // between check-ins, failing instantly (ECONNRESET) into a bare
+  // `catch {}` — no retry, no log. The completion `ok` was lost far
+  // more often than the opener, leaving monitors on "in_progress →
+  // Timed Out" every minute.
+  //
+  // The fix is transport-level retry: when the fetch THROWS, undici has
+  // already evicted the dead pooled connection, so the retry rides a
+  // fresh connection and succeeds — up to 3 attempts total, with a
+  // short jittered backoff between attempts. An HTTP response of ANY
+  // status (including 429/5xx) is a definitive answer from Sentry's
+  // edge and is never retried. Attempt 1 keeps the original 5s abort
+  // timeout; retries get 2s each — worst case ~9s + backoffs vs. the
+  // old 5s, while the steady-state cost is unchanged because the
+  // stale-conn failure that triggers a retry is instant.
+  const attemptTimeoutsMs = [5000, 2000, 2000];
+
+  for (let attempt = 1; attempt <= attemptTimeoutsMs.length; attempt++) {
+    if (attempt > 1) {
+      try {
+        metrics.increment('sentry.checkin.retry');
+      } catch {
+        /* swallowed: observability path must never crash the response */
+      }
+      // Jittered backoff so a burst of same-minute crons retrying in
+      // lockstep doesn't re-converge on Sentry's edge simultaneously.
+      await new Promise((resolve) =>
+        setTimeout(resolve, 100 + Math.random() * 150),
       );
     }
-  } catch {
-    /* swallowed: observability path must never crash the response */
-  } finally {
-    clearTimeout(timer);
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      attemptTimeoutsMs[attempt - 1] ?? 2000,
+    );
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      // Sentry's Crons ingest returns 202 Accepted on success. A 4xx here
+      // typically means a bad DSN, project mismatch, or rate-limit; a 5xx
+      // means Sentry is down. Either way we still swallow (observability
+      // must never crash the response), but we log so the next "timeouts
+      // are firing again" investigation can immediately see whether the
+      // check-in itself was rejected vs. some other layer breaking.
+      if (!response.ok) {
+        logger.warn(
+          {
+            monitorSlug: input.monitorSlug,
+            status: input.status,
+            httpStatus: response.status,
+          },
+          'sentry check-in rejected',
+        );
+      }
+      // ANY response — ok or not — is a delivered-and-answered POST.
+      return checkInId;
+    } catch (err) {
+      // Transport failure (stale-conn reset, abort-timeout, DNS blip).
+      // Loop retries on a fresh connection; on the final attempt, count
+      // and log the loss that used to be silent. Never throw —
+      // observability paths must never crash the response — so the
+      // reporting itself is also guarded (mirrors flushSentry's
+      // defense against narrow test mocks / SDK surface changes).
+      if (attempt === attemptTimeoutsMs.length) {
+        try {
+          metrics.increment('sentry.checkin.delivery_failed');
+          logger.warn(
+            {
+              monitorSlug: input.monitorSlug,
+              status: input.status,
+              attempts: attempt,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            'sentry check-in delivery failed after retries',
+          );
+        } catch {
+          /* swallowed: observability path must never crash the response */
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
   return checkInId;
 }

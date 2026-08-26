@@ -105,7 +105,7 @@ import {
 } from '../_lib/cron-instrumentation.js';
 import { cronGuard } from '../_lib/api-helpers.js';
 import { reportCronRun } from '../_lib/axiom.js';
-import { Sentry } from '../_lib/sentry.js';
+import { metrics, Sentry } from '../_lib/sentry.js';
 import logger from '../_lib/logger.js';
 import { waitUntil } from '@vercel/functions';
 
@@ -967,8 +967,62 @@ describe('withCronCheckin', () => {
 
     expect(inner).toHaveBeenCalledTimes(1);
     expect(res._status).toBe(200);
-    // We did try to hit Sentry — once for in_progress, once for ok.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Transport failures now retry: 3 attempts per check-in, two
+    // check-ins (in_progress + ok) → 6 total fetch attempts.
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    // Exhausting all attempts logs + counts the previously-silent loss
+    // path (once per check-in).
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        monitorSlug: 'checkin-job',
+        attempts: 3,
+        err: 'Sentry unreachable',
+      }),
+      'sentry check-in delivery failed after retries',
+    );
+    expect(metrics.increment).toHaveBeenCalledWith(
+      'sentry.checkin.delivery_failed',
+    );
+  });
+
+  it('retries a transport failure on a fresh connection', async () => {
+    // The stale keep-alive pool failure mode: the first POST rides a
+    // pooled connection Sentry's edge already closed and rejects
+    // instantly (ECONNRESET); undici evicts the dead connection, so the
+    // retry rides a fresh one and succeeds. The completion check-in must
+    // be delivered — this is the 2026-08-26 fix for the ~2/3 silent
+    // check-in loss.
+    fetchMock.mockRejectedValueOnce(new Error('ECONNRESET'));
+    const inner = vi.fn(async (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    const wrapped = withCronCheckin('checkin-job', inner);
+
+    const res = mockResponse();
+    await wrapped(authedReq(), res);
+
+    expect(res._status).toBe(200);
+    // 3 total fetches: failed in_progress attempt, retried in_progress
+    // (delivered), then the ok completion on its first attempt.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // Both check-ins landed — the retried in_progress and the ok pair
+    // by the same check_in_id.
+    const calls = getCheckInCalls();
+    expect(calls[1]!.body).toMatchObject({ status: 'in_progress' });
+    expect(calls[2]!.body).toMatchObject({
+      status: 'ok',
+      check_in_id: calls[1]!.body.check_in_id,
+    });
+    // Recovered delivery is NOT a delivery failure — but the retry
+    // itself is counted for observability.
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.anything(),
+      'sentry check-in delivery failed after retries',
+    );
+    expect(metrics.increment).toHaveBeenCalledWith('sentry.checkin.retry');
+    expect(metrics.increment).not.toHaveBeenCalledWith(
+      'sentry.checkin.delivery_failed',
+    );
   });
 
   it('logs a warning when Sentry returns non-2xx for a check-in', async () => {
@@ -993,15 +1047,21 @@ describe('withCronCheckin', () => {
       }),
       'sentry check-in rejected',
     );
+    // An HTTP response of ANY status is a definitive answer from Sentry
+    // — only TRANSPORT failures retry. Exactly 1 fetch per check-in
+    // (in_progress + ok), never 3.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('serializes failureIssueThreshold on monitor_config upsert', async () => {
     // High-frequency monitors carry an elevated failureIssueThreshold
     // in the monitor_config block so Sentry waits for 3 consecutive
-    // misses before opening an issue. This silences transient noise
-    // (~5% miss rate from stale keep-alive sockets) while still
-    // detecting real outages (3 consecutive misses on every-minute
-    // crons = 3min of no completions).
+    // misses before opening an issue. Stale keep-alive transport drops
+    // are now retried on a fresh connection, so this threshold only
+    // absorbs the residual noise (all retries exhausted — a genuinely
+    // unreachable Sentry) while still detecting real outages (3
+    // consecutive misses on every-minute crons = 3min of no
+    // completions).
     const inner = vi.fn(async (_req, res) => {
       res.status(200).json({ ok: true });
     });

@@ -1,13 +1,29 @@
 /**
  * Data-integrity rules for per-strike Greek exposure.
  *
- * Exists because of one vendor behaviour: `greek-exposure/strike-expiry`
- * returns the AM-settled and PM-settled series for a monthly expiry merged
- * into one array **with no field that tells them apart**. UW staff confirmed
- * this on 2026-08-21; reproduced live on 2026-08-25, where 2026-08-21 came
- * back as 1,090 rows carrying 590 unique `(expiry, strike)` keys — 500
- * duplicated, 293 of those with different greeks — while the neighbouring
- * non-OPEX session was perfectly unique.
+ * Exists because of two vendor behaviours that collide the same key and
+ * demand opposite resolutions.
+ *
+ * The first: `greek-exposure/strike-expiry` returns the AM-settled and
+ * PM-settled series for a monthly expiry merged into one array **with no
+ * field that tells them apart**. UW staff confirmed this on 2026-08-21;
+ * reproduced live on 2026-08-25, where 2026-08-21 came back as 1,090 rows
+ * carrying 590 unique `(expiry, strike)` keys — 500 duplicated, 293 of those
+ * with different greeks — while the neighbouring non-OPEX session was
+ * perfectly unique. Two real series → their sum is the total exposure.
+ *
+ * The second, observed once (2025-10-14, found by the Trading-Bot gamma
+ * rebuild): the same endpoint served every strike on 35 SPXW-only expiries
+ * **twice**, as two intraday snapshot vintages of one series — pairs a
+ * median 1.53% apart. One series served twice → summing doubles the day
+ * (~1.56M vs a plausible 785k gross); the mean recovers it.
+ *
+ * The two cases are told apart by OSI root evidence from
+ * `/stock/SPX/option-chains?date=D`, which the payload itself drops: an
+ * AM/PM merge happens only on expiries listed under **both** roots (SPX and
+ * SPXW), while snapshot duplicates arrive on single-root expiries. A caller
+ * holding that evidence passes it as `dualRootExpiries` and the rule is
+ * resolved per expiry; without it, the uniform batch rule applies.
  *
  * `greek_exposure_strike` is keyed `UNIQUE (date, expiry, strike)`, so an
  * upsert of that payload discarded one series per collided strike and said
@@ -18,7 +34,7 @@
  * send one, so there is no honest way to label a row AM or PM. What it does
  * instead is make the collision *impossible to ignore*: either the caller
  * names a deterministic rule for combining the rows — which is then applied
- * uniformly and recorded on every affected row — or ingestion refuses.
+ * and recorded on every affected row — or ingestion refuses.
  *
  * A note on the field the owner asked to key on. The requested duplicate key
  * was `(underlying, expiry, strike, option_type, observed_at)`. The payload
@@ -44,14 +60,22 @@
  *     (`observed_at`, `spot`, `spot_observed_at`, `calculated_at`,
  *     `source_rows`, `dedupe_rule`, `spec_version`, `source_commit`) written
  *     on every row.
+ * 3 — the rule is now chosen per expiry by OSI root evidence when available:
+ *     dual-root (SPX + SPXW) expiries are genuine AM/PM merges and are still
+ *     summed, while single-root snapshot duplicates are averaged, not summed.
  *
  * Bump this when the meaning of a stored row changes. Research code should
  * filter on it rather than assume every row in the table was produced the
  * same way.
  */
-export const GEX_STRIKE_SPEC_VERSION = 2;
+export const GEX_STRIKE_SPEC_VERSION = 3;
 
-/** Rows at or above this version may be used for research without caveat. */
+/**
+ * Rows at or above this version may be used for research without caveat.
+ * Spec-2 rows stay trusted because the snapshot failure mode spec 3 guards
+ * against recurred roughly once in three years and was not observed during
+ * the one-session spec-2 window.
+ */
 export const GEX_STRIKE_MIN_TRUSTED_SPEC_VERSION = 2;
 
 // ── Duplicate handling ────────────────────────────────────────
@@ -60,11 +84,15 @@ export const GEX_STRIKE_MIN_TRUSTED_SPEC_VERSION = 2;
  * `strict` — refuse the batch. Correct when a caller cannot tolerate an
  *   assumption about what the duplicate means.
  * `sum` — add the numeric greeks across the collided rows. The defensible
- *   reading for this vendor: both series are real open interest at that
+ *   reading for the AM/PM merge: both series are real open interest at that
  *   strike on that expiry date, so total dealer exposure is their sum, and
  *   it is what UW's own web platform displays for a combined view.
+ * `mean` — average them instead. The defensible reading for repeated
+ *   snapshots of ONE series: averaging recovers the series, while summing
+ *   doubles it. Observed 2025-10-14, where 35 SPXW-only expiries each
+ *   arrived twice as two intraday vintages, pairs a median 1.53% apart.
  */
-export type DedupeRule = 'strict' | 'sum';
+export type DedupeRule = 'strict' | 'sum' | 'mean';
 
 /**
  * The rule ingestion runs under. `sum` rather than `strict` because a strict
@@ -75,7 +103,23 @@ export type DedupeRule = 'strict' | 'sum';
  */
 export const DEFAULT_DEDUPE_RULE: DedupeRule = 'sum';
 
-/** Numeric columns combined when the rule is `sum`. */
+/**
+ * The relative spread below which a summed collision pair looks like a
+ * probable snapshot duplicate rather than a genuine AM/PM merge. Only
+ * consulted when no root evidence is available — it flags "these rows were
+ * summed but they look like one series served twice, so the day's gamma may
+ * be doubled" for a human to check. The measured distributions sit far
+ * apart: snapshot pairs were a median 1.53% apart (p95 18.4%), AM/PM pairs a
+ * median ~87%. Five percent catches the bulk of the former without tripping
+ * on the latter.
+ */
+export const NEAR_IDENTICAL_REL_DIFF = 0.05;
+
+/**
+ * Numeric columns combined by the resolution rules — summed under `sum`,
+ * averaged under `mean` — and the columns `maxRelDiff` measures its spread
+ * over.
+ */
 const SUMMABLE = [
   'call_gex',
   'put_gex',
@@ -114,11 +158,23 @@ export interface Collision {
   rows: number;
   /** True when the collided rows carried identical greeks. */
   identical: boolean;
+  /**
+   * The rule applied to this collision — or, on the strict-throw path, the
+   * rule that WOULD have applied had the caller allowed a resolution.
+   */
+  rule: 'sum' | 'mean';
+  /**
+   * Max over the summable fields of the group's relative spread
+   * `(hi − lo) / max(|hi|, |lo|)`, 0 when a field is 0 everywhere. Near
+   * zero → probable snapshot duplicate; large → genuine AM/PM divergence.
+   */
+  maxRelDiff: number;
 }
 
 export interface DedupeResult<T extends StrikeKeyed> {
-  rows: (T & { source_rows: number })[];
+  rows: (T & { source_rows: number; dedupe_rule: DedupeRule })[];
   collisions: Collision[];
+  /** The batch rule. Combined rows may carry a per-expiry override. */
   rule: DedupeRule;
 }
 
@@ -135,8 +191,9 @@ export class DuplicateStrikeRowsError extends Error {
         `response and dedupe rule is 'strict': ${sample}` +
         (collisions.length > 3 ? ', …' : '') +
         '. The vendor merges AM- and PM-settled series with no discriminator; ' +
-        "pass rule: 'sum' to combine them, and the choice will be recorded on " +
-        'every affected row.',
+        "pass rule: 'sum' to combine them (or rule: 'mean' for snapshot " +
+        'duplicates, or dualRootExpiries to resolve per expiry from root ' +
+        'evidence), and the choice will be recorded on every affected row.',
     );
     this.name = 'DuplicateStrikeRowsError';
     this.collisions = collisions;
@@ -157,17 +214,34 @@ const num = (v: unknown): number => {
 /**
  * Collapse rows that share `(date, expiry, strike)` under the named rule.
  *
- * Order-independent by construction: `sum` is commutative, so unlike the
- * upsert it replaces, the result does not depend on which series the vendor
- * happened to list first. Rows that did not collide are returned unchanged
- * apart from `source_rows: 1`, which is what lets a consumer separate a
- * combined row from an original one without guessing.
+ * Order-independent by construction: `sum` and `mean` are both commutative,
+ * so unlike the upsert it replaces, the result does not depend on which
+ * series the vendor happened to list first. Rows that did not collide are
+ * returned unchanged apart from `source_rows: 1` and the batch rule as
+ * `dedupe_rule`, which is what lets a consumer separate a combined row from
+ * an original one without guessing.
+ *
+ * `dualRootExpiries` is the OSI root evidence from the option-chains
+ * endpoint (see the module header): when supplied, the rule is resolved per
+ * expiry — dual-root → `sum` (genuine AM/PM merge), single-root → `mean`
+ * (snapshot duplicate) — and each combined row records the rule that
+ * actually touched it. When absent, the uniform batch rule applies.
  */
 export function dedupeStrikeRows<T extends StrikeKeyed>(
   rows: T[],
-  options: { rule?: DedupeRule } = {},
+  options: { rule?: DedupeRule; dualRootExpiries?: ReadonlySet<string> } = {},
 ): DedupeResult<T> {
   const rule = options.rule ?? DEFAULT_DEDUPE_RULE;
+  const { dualRootExpiries } = options;
+
+  // The rule a collision on this expiry gets — or, under `strict`, the rule
+  // it would have gotten, so the thrown collisions still say what a
+  // permissive caller would have done.
+  const resolveRule = (expiry: string): 'sum' | 'mean' => {
+    if (dualRootExpiries) return dualRootExpiries.has(expiry) ? 'sum' : 'mean';
+    return rule === 'mean' ? 'mean' : 'sum';
+  };
+
   const groups = new Map<string, T[]>();
   for (const row of rows) {
     const key = keyOf(row);
@@ -185,12 +259,23 @@ export function dedupeStrikeRows<T extends StrikeKeyed>(
         (f) => String(fieldOf(r, f) ?? '') === String(fieldOf(first, f) ?? ''),
       ),
     );
+    let maxRelDiff = 0;
+    for (const field of SUMMABLE) {
+      const values = group.map((r) => num(fieldOf(r, field)));
+      const hi = Math.max(...values);
+      const lo = Math.min(...values);
+      const denom = Math.max(Math.abs(hi), Math.abs(lo));
+      const rel = denom === 0 ? 0 : (hi - lo) / denom;
+      if (rel > maxRelDiff) maxRelDiff = rel;
+    }
     collisions.push({
       date: first.date,
       expiry: first.expiry,
       strike: first.strike,
       rows: group.length,
       identical,
+      rule: resolveRule(first.expiry),
+      maxRelDiff,
     });
   }
 
@@ -198,22 +283,27 @@ export function dedupeStrikeRows<T extends StrikeKeyed>(
     throw new DuplicateStrikeRowsError(collisions);
   }
 
-  const out: (T & { source_rows: number })[] = [];
+  const out: (T & { source_rows: number; dedupe_rule: DedupeRule })[] = [];
   for (const [, group] of groups) {
     const first = group[0]!;
     if (group.length === 1) {
-      out.push({ ...first, source_rows: 1 });
+      out.push({ ...first, source_rows: 1, dedupe_rule: rule });
       continue;
     }
+    const applied = resolveRule(first.expiry);
     const combined: Record<string, unknown> = {
       ...(first as unknown as Record<string, unknown>),
     };
     for (const field of SUMMABLE) {
-      combined[field] = group
-        .reduce((sum, r) => sum + num(fieldOf(r, field)), 0)
-        .toString();
+      const total = group.reduce((sum, r) => sum + num(fieldOf(r, field)), 0);
+      const value = applied === 'mean' ? total / group.length : total;
+      combined[field] = value.toString();
     }
-    out.push({ ...(combined as T), source_rows: group.length });
+    out.push({
+      ...(combined as T),
+      source_rows: group.length,
+      dedupe_rule: applied,
+    });
   }
   return { rows: out, collisions, rule };
 }

@@ -18,6 +18,7 @@ import {
   DEFAULT_DEDUPE_RULE,
   DuplicateStrikeRowsError,
   GEX_STRIKE_SPEC_VERSION,
+  NEAR_IDENTICAL_REL_DIFF,
   assessSpotFreshness,
   dedupeStrikeRows,
   isOpexExpiry,
@@ -132,6 +133,111 @@ describe('dedupeStrikeRows', () => {
       expect(collisions).toEqual([]);
       expect(rows.map((r) => r.call_gex)).toEqual(['1.0000', '2.0000']);
     }
+  });
+
+  it('averages the summable fields under the uniform mean rule', () => {
+    const { rows, collisions, rule } = dedupeStrikeRows(BEFORE, {
+      rule: 'mean',
+    });
+
+    expect(rule).toBe('mean');
+    const combined = rows.find(
+      (r) => r.expiry === OPEX && r.strike === '6800',
+    )!;
+    expect(Number(combined.call_gex)).toBeCloseTo(
+      (6105.1409 + 2201.0002) / 2,
+      4,
+    );
+    expect(Number(combined.put_gex)).toBeCloseTo(-100, 4);
+    expect(combined.dedupe_rule).toBe('mean');
+    expect(collisions[0]!.rule).toBe('mean');
+  });
+
+  it('divides by the full group size when more than two snapshots collide', () => {
+    const triple = [
+      row(NON_OPEX, '6800', '100.0000'),
+      row(NON_OPEX, '6800', '110.0000'),
+      row(NON_OPEX, '6800', '120.0000'),
+    ];
+    const { rows, collisions } = dedupeStrikeRows(triple, { rule: 'mean' });
+
+    expect(collisions[0]).toMatchObject({ rows: 3, rule: 'mean' });
+    const combined = rows[0]!;
+    expect(Number(combined.call_gex)).toBeCloseTo((100 + 110 + 120) / 3, 4);
+    expect(combined.source_rows).toBe(3);
+    expect(combined.dedupe_rule).toBe('mean');
+  });
+
+  it('resolves the rule per expiry when root evidence is supplied', () => {
+    const dualRoot = OPEX; // listed under both SPX and SPXW roots
+    const singleRoot = NON_OPEX; // SPXW only
+    const batch = [
+      row(dualRoot, '6800', '6105.1409'), // AM series
+      row(dualRoot, '6800', '2201.0002'), // PM series, same key
+      row(singleRoot, '6800', '1000.0000'), // one snapshot…
+      row(singleRoot, '6800', '1010.0000'), // …served twice
+      row(singleRoot, '6850', '3000.0000'), // untouched
+    ];
+    const { rows, collisions, rule } = dedupeStrikeRows(batch, {
+      dualRootExpiries: new Set([dualRoot]),
+    });
+
+    // Top-level rule is still the batch rule; the per-expiry resolution is
+    // recorded on the collisions and rows it touched.
+    expect(rule).toBe('sum');
+
+    const summed = rows.find(
+      (r) => r.expiry === dualRoot && r.strike === '6800',
+    )!;
+    expect(Number(summed.call_gex)).toBeCloseTo(6105.1409 + 2201.0002, 4);
+    expect(summed.dedupe_rule).toBe('sum');
+
+    const averaged = rows.find(
+      (r) => r.expiry === singleRoot && r.strike === '6800',
+    )!;
+    expect(Number(averaged.call_gex)).toBeCloseTo(1005, 4);
+    expect(averaged.dedupe_rule).toBe('mean');
+
+    const untouched = rows.find((r) => r.strike === '6850')!;
+    expect(untouched.source_rows).toBe(1);
+    expect(untouched.dedupe_rule).toBe('sum');
+
+    expect(collisions).toHaveLength(2);
+    expect(collisions.find((c) => c.expiry === dualRoot)!.rule).toBe('sum');
+    expect(collisions.find((c) => c.expiry === singleRoot)!.rule).toBe('mean');
+  });
+
+  it('reports zero spread for an identical pair', () => {
+    const twin = row(OPEX, '6900', '77.0000');
+    const { collisions } = dedupeStrikeRows([twin, { ...twin }]);
+    expect(collisions[0]!.maxRelDiff).toBe(0);
+  });
+
+  it('measures the spread of a near-identical snapshot pair', () => {
+    const pair = [
+      row(NON_OPEX, '6800', '1000.0000'),
+      row(NON_OPEX, '6800', '985.0000'),
+    ];
+    const { collisions } = dedupeStrikeRows(pair);
+    expect(collisions[0]!.maxRelDiff).toBeCloseTo(0.015, 4);
+  });
+
+  it('measures the AM/PM pair as structurally different', () => {
+    const { collisions } = dedupeStrikeRows(BEFORE);
+    expect(collisions[0]!.maxRelDiff).toBeGreaterThan(0.4);
+  });
+
+  it('draws the near-identical line at five percent', () => {
+    expect(NEAR_IDENTICAL_REL_DIFF).toBe(0.05);
+  });
+
+  it('still refuses the batch under strict when root evidence is supplied', () => {
+    expect(() =>
+      dedupeStrikeRows(BEFORE, {
+        rule: 'strict',
+        dualRootExpiries: new Set([OPEX]),
+      }),
+    ).toThrow(DuplicateStrikeRowsError);
   });
 });
 
@@ -280,8 +386,8 @@ describe('spot freshness', () => {
 });
 
 describe('spec version', () => {
-  it('is 2 — rows below it were written by the overwriting version', () => {
-    expect(GEX_STRIKE_SPEC_VERSION).toBe(2);
+  it('is 3 — the rule is now chosen per expiry from root evidence', () => {
+    expect(GEX_STRIKE_SPEC_VERSION).toBe(3);
   });
 });
 

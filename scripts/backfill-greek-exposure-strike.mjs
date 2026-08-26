@@ -23,6 +23,7 @@ import { neon } from '@neondatabase/serverless';
 
 import {
   GEX_STRIKE_SPEC_VERSION,
+  NEAR_IDENTICAL_REL_DIFF,
   dedupeStrikeRows,
   isOpexExpiry,
 } from '../api/_lib/gex-strike-integrity.ts';
@@ -91,6 +92,19 @@ async function storeStrikeRows(rawRows, date, counters) {
         `(${differing} with differing greeks) combined by rule '${rule}'` +
         (isOpexExpiry(date) ? ' — monthly OPEX' : ''),
     );
+    // This script runs the uniform sum rule with no root evidence, so a
+    // snapshot-duplicate day (see the lib header) would be silently doubled.
+    // Flag the near-identical pairs loudly so a human checks the day rather
+    // than trusting the stamp.
+    const nearIdentical = collisions.filter(
+      (c) => c.maxRelDiff <= NEAR_IDENTICAL_REL_DIFF,
+    );
+    if (nearIdentical.length > 0) {
+      console.warn(
+        `  ${date}: WARNING — ${nearIdentical.length} near-identical pair(s) ` +
+          "summed without root evidence; the day's gamma may be doubled",
+      );
+    }
     counters.collisions = (counters.collisions ?? 0) + collisions.length;
   }
 

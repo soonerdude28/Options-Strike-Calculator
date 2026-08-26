@@ -21,9 +21,14 @@
  * That key is NOT unique in the vendor's own payload on a monthly expiry: UW
  * returns the AM-settled and PM-settled series merged with no discriminator
  * (staff-confirmed 2026-08-21), so the upsert used to discard one series per
- * collided strike without raising anything. Rows are now collapsed before the
- * write by a named, recorded rule — see ../_lib/gex-strike-integrity.ts — and
- * the count of collisions is returned and logged rather than absorbed.
+ * collided strike without raising anything. The vendor has also served every
+ * strike on single-root (SPXW-only) expiries twice, as two intraday snapshot
+ * vintages of one series (observed 2025-10-14) — a mode where summing doubles
+ * the day. Rows are now collapsed before the write by a named, recorded rule
+ * — see ../_lib/gex-strike-integrity.ts — chosen per expiry from OSI root
+ * evidence on collision days: dual-root (SPX + SPXW) expiries are genuine
+ * AM/PM merges and are summed, single-root duplicates are averaged. The count
+ * of collisions is returned and logged rather than absorbed.
  *
  * Every row carries its provenance: which rule combined it and from how many
  * vendor rows, when it was fetched and computed, the underlying spot with the
@@ -33,7 +38,8 @@
  * nor a timestamp, so freshness is established from /spot-exposures/strike —
  * which does return `time` — and recorded as verified / stale / unverified.
  *
- * Total API calls per invocation: 2 (chain + spot preflight)
+ * Total API calls per invocation: 2 (chain + spot preflight), +1
+ * (option-chains) on collision days.
  *
  * Schedule: 30 13,14 * * 1-5 (DST-safe dual slot). The default
  * isMarketHours() gate opens at 9:25 ET, so a single 13:30 UTC slot runs in
@@ -51,6 +57,7 @@ import { getDb } from '../_lib/db.js';
 import { BUILD_SHA } from '../_lib/build-info.js';
 import {
   GEX_STRIKE_SPEC_VERSION,
+  NEAR_IDENTICAL_REL_DIFF,
   assessSpotFreshness,
   dedupeStrikeRows,
   isOpexExpiry,
@@ -105,7 +112,6 @@ function computeColumns(row: StrikeRow) {
 
 interface Provenance {
   underlying: string;
-  dedupeRule: DedupeRule;
   observedAt: string;
   calculatedAt: string;
   spot: number | null;
@@ -114,7 +120,7 @@ interface Provenance {
 }
 
 async function storeStrikeRows(
-  rows: (StrikeRow & { source_rows: number })[],
+  rows: (StrikeRow & { source_rows: number; dedupe_rule: DedupeRule })[],
   prov: Provenance,
 ): Promise<{ stored: number; skipped: number }> {
   if (rows.length === 0) return { stored: 0, skipped: 0 };
@@ -153,7 +159,7 @@ async function storeStrikeRows(
             ${row.call_vanna}, ${row.put_vanna},
             ${netGex}, ${netDelta}, ${netCharm}, ${netVanna},
             ${absGex}, ${callGexFraction},
-            ${prov.underlying}, ${row.source_rows}, ${prov.dedupeRule},
+            ${prov.underlying}, ${row.source_rows}, ${row.dedupe_rule},
             ${prov.observedAt}, ${prov.calculatedAt},
             ${prov.spot}, ${prov.spotObservedAt}, ${prov.spotFreshness},
             ${GEX_STRIKE_SPEC_VERSION}, ${BUILD_SHA}
@@ -230,6 +236,66 @@ async function fetchSpotWithTime(
   }
 }
 
+// ── Root evidence ────────────────────────────────────────────
+
+/** OSI option symbol: root, yymmdd expiry, C/P, strike ×1000. */
+const OSI_SYMBOL = /^([A-Z]+)(\d{6})[CP]\d{8}$/;
+
+/**
+ * Which OSI roots list each expiry, from `/stock/SPX/option-chains`.
+ *
+ * This is the discriminator the strike-expiry payload drops: its rows carry
+ * no root at all, but the option-chains symbols do — `SPX...` and `SPXW...`
+ * spell it out. An expiry listed under both roots is a genuine AM/PM merge
+ * whose collided rows must be summed; an expiry listed under one root can
+ * only have collided by being served twice, and its rows must be averaged.
+ *
+ * Returns null when the fetch throws or when zero symbols parse, and the
+ * caller falls back to the uniform sum rule: this is evidence, not data, so
+ * a failed evidence fetch must degrade the resolution, not fail the run.
+ * Deliberately no withRetry for the same reason.
+ */
+async function fetchChainRoots(
+  apiKey: string,
+  date: string,
+): Promise<ReadonlyMap<string, ReadonlySet<string>> | null> {
+  try {
+    const symbols = await uwFetch<string>(
+      apiKey,
+      `/stock/SPX/option-chains?date=${date}`,
+    );
+    const roots = new Map<string, Set<string>>();
+    for (const symbol of symbols) {
+      const m = OSI_SYMBOL.exec(symbol);
+      if (!m) continue;
+      const root = m[1]!;
+      const ymd = m[2]!;
+      const yy = ymd.slice(0, 2);
+      const mm = ymd.slice(2, 4);
+      const dd = ymd.slice(4, 6);
+      const expiry = `20${yy}-${mm}-${dd}`;
+      const bucket = roots.get(expiry);
+      if (bucket) bucket.add(root);
+      else roots.set(expiry, new Set([root]));
+    }
+    if (roots.size === 0) {
+      logger.warn(
+        { date, symbols: symbols.length },
+        'fetch-greek-exposure-strike: option-chains returned no parseable ' +
+          'OSI symbols — no root evidence',
+      );
+      return null;
+    }
+    return roots;
+  } catch (err) {
+    logger.warn(
+      { err, date },
+      'fetch-greek-exposure-strike: option-chains root-evidence fetch failed',
+    );
+    return null;
+  }
+}
+
 // ── Handler ──────────────────────────────────────────────────
 
 export default withCronInstrumentation(
@@ -250,25 +316,107 @@ export default withCronInstrumentation(
 
     const skippedZero = allRows.length - filtered.length;
 
-    // Collapse the AM/PM collision before it reaches a key that cannot hold
-    // both. See ../_lib/gex-strike-integrity.ts for why the rule is named.
-    const { rows, collisions, rule } = dedupeStrikeRows(filtered);
+    // Collapse the collision before it reaches a key that cannot hold both
+    // rows. Probe under the default sum rule first; only a collision earns
+    // the extra option-chains call that says which rule each expiry needs.
+    // See ../_lib/gex-strike-integrity.ts for why the rule is named.
+    let { rows, collisions, rule } = dedupeStrikeRows(filtered);
+    let rootEvidence: 'not_needed' | 'applied' | 'unavailable' = 'not_needed';
     if (collisions.length > 0) {
-      const differing = collisions.filter((c) => !c.identical).length;
+      const chainRoots = await fetchChainRoots(apiKey, today);
+      const collidedExpiries = [...new Set(collisions.map((c) => c.expiry))];
+      // Evidence is usable only when it covers every collided expiry — a map
+      // that is silent about an expiry cannot say which rule it needs.
+      if (chainRoots && collidedExpiries.every((e) => chainRoots.has(e))) {
+        const dualRootExpiries = new Set(
+          [...chainRoots]
+            .filter(([, roots]) => roots.size >= 2)
+            .map(([expiry]) => expiry),
+        );
+        ({ rows, collisions, rule } = dedupeStrikeRows(filtered, {
+          dualRootExpiries,
+        }));
+        rootEvidence = 'applied';
+      } else {
+        rootEvidence = 'unavailable';
+      }
+    }
+
+    // A mean collision is the anomalous vendor failure: a single-root expiry
+    // collided, so the vendor served duplicate intraday snapshots of one
+    // series. Averaged, not summed — and loud, because this has happened
+    // roughly once in three years.
+    const meanCollisions = collisions.filter((c) => c.rule === 'mean');
+    if (meanCollisions.length > 0) {
+      logger.error(
+        {
+          date: today,
+          meanCollisions: meanCollisions.length,
+          sample: meanCollisions.slice(0, 3),
+          rootEvidence,
+        },
+        'greek_exposure_strike: single-root expiry collided — the vendor ' +
+          'served duplicate intraday snapshots; rows averaged, not summed',
+      );
+      Sentry.captureException(
+        new Error(
+          `greek_exposure_strike: ${meanCollisions.length} single-root ` +
+            `expiry collision(s) on ${today} — vendor served duplicate ` +
+            'intraday snapshots; rows averaged',
+        ),
+      );
+    }
+
+    // A summed pair that is near-identical is the same failure mode wearing
+    // a sum it should not have gotten — but only when the root evidence that
+    // would have demoted it to mean was unavailable. Under applied evidence
+    // a near-identical summed pair is a confirmed AM/PM merge that happens
+    // to be close, so it is not an anomaly and stays out of this set.
+    const nearIdentical =
+      rootEvidence === 'unavailable'
+        ? collisions.filter(
+            (c) => c.rule === 'sum' && c.maxRelDiff <= NEAR_IDENTICAL_REL_DIFF,
+          )
+        : [];
+    if (nearIdentical.length > 0) {
+      logger.error(
+        {
+          date: today,
+          nearIdenticalCollisions: nearIdentical.length,
+          maxRelDiffs: nearIdentical.slice(0, 3).map((c) => c.maxRelDiff),
+          sample: nearIdentical.slice(0, 3),
+        },
+        'greek_exposure_strike: near-identical collision pairs summed ' +
+          "without root evidence — the day's gamma may be doubled",
+      );
+      Sentry.captureException(
+        new Error(
+          `greek_exposure_strike: ${nearIdentical.length} near-identical ` +
+            `collision pair(s) on ${today} summed without root evidence — ` +
+            "the day's gamma may be doubled",
+        ),
+      );
+    }
+
+    // Every summed collision keeps the warn — the expected AM/PM merge is
+    // still a resolution worth seeing, whatever its spread. The two error
+    // paths above escalate; they do not replace this.
+    const summed = collisions.filter((c) => c.rule === 'sum');
+    if (summed.length > 0) {
+      const differing = summed.filter((c) => !c.identical).length;
       logger.warn(
         {
           date: today,
-          collisions: collisions.length,
+          collisions: summed.length,
           differingGreeks: differing,
           rule,
+          rootEvidence,
           opexExpiries: [
             ...new Set(
-              collisions
-                .filter((c) => isOpexExpiry(c.expiry))
-                .map((c) => c.expiry),
+              summed.filter((c) => isOpexExpiry(c.expiry)).map((c) => c.expiry),
             ),
           ],
-          sample: collisions.slice(0, 3),
+          sample: summed.slice(0, 3),
         },
         'greek_exposure_strike: duplicate (underlying, expiry, strike) collision ' +
           'resolved by named rule — the vendor merges AM/PM settled series',
@@ -307,7 +455,6 @@ export default withCronInstrumentation(
     const { stored, skipped } = await withRetry(() =>
       storeStrikeRows(rows, {
         underlying: 'SPX',
-        dedupeRule: rule,
         observedAt: observedAt.toISOString(),
         calculatedAt: new Date().toISOString(),
         spot: spotSample?.price ?? null,
@@ -386,9 +533,17 @@ export default withCronInstrumentation(
         stored,
         skipped,
         // Surfaced, not absorbed: a caller reading the cron result can tell a
-        // clean session from one where two series were combined.
+        // clean session from one where two series were combined — and which
+        // rule combined them, on what evidence.
         collisions: collisions.length,
         dedupeRule: rule,
+        sumCollisions: summed.length,
+        meanCollisions: meanCollisions.length,
+        // Anomaly signal, not a spread census: nonzero only when pairs that
+        // look like snapshot duplicates were summed with no root evidence to
+        // demote them. A routine OPEX day under applied evidence reports 0.
+        nearIdenticalCollisions: nearIdentical.length,
+        rootEvidence,
         spotFreshness,
         specVersion: GEX_STRIKE_SPEC_VERSION,
         reconciled: reconciliation.ok,

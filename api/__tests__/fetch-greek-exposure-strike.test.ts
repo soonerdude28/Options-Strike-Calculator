@@ -330,4 +330,248 @@ describe('fetch-greek-exposure-strike handler', () => {
     );
     expect(logger.error).toHaveBeenCalled();
   });
+
+  // ── Collision-day root evidence ────────────────────────────
+
+  describe('collision-day root evidence', () => {
+    /**
+     * Route uwFetch by path: the strike-expiry fetch, the spot preflight,
+     * and — on collision days only — the option-chains root-evidence call.
+     * Omitting `chains` makes the option-chains call reject, which is the
+     * evidence-unavailable case.
+     */
+    const stubUwFeeds = (
+      strikeRows: ReturnType<typeof makeStrikeRow>[],
+      chains?: string[],
+    ) => {
+      mockUwFetch.mockImplementation(async (_key: unknown, path: unknown) => {
+        const p = String(path);
+        if (p.includes('option-chains')) {
+          if (!chains) throw new Error('option-chains unavailable');
+          return chains;
+        }
+        if (p.includes('spot-exposures')) return [];
+        return strikeRows;
+      });
+    };
+
+    const optionChainsCalled = () =>
+      mockUwFetch.mock.calls.some((call) =>
+        String(call[1]).includes('option-chains'),
+      );
+
+    /** Capture the values bound to the (single) per-row INSERT template. */
+    const captureInsertValues = () => {
+      const captured: { values: unknown[] } = { values: [] };
+      mockTransaction.mockImplementationOnce(
+        async (fn: (txn: (...args: unknown[]) => unknown) => unknown[]) => {
+          const txnFn = (..._args: unknown[]) => {
+            captured.values = _args.slice(1);
+            return {};
+          };
+          const queries = fn(txnFn);
+          return queries.map(() => [{ strike: '6800' }]);
+        },
+      );
+      return captured;
+    };
+
+    const run = async () => {
+      const req = mockRequest({
+        method: 'GET',
+        headers: { authorization: 'Bearer test-secret' },
+      });
+      const res = mockResponse();
+      await handler(req, res);
+      return res;
+    };
+
+    it('does not spend the option-chains call on a clean day', async () => {
+      stubUwFeeds([makeStrikeRow()], ['SPXW260410C06800000']);
+      mockSql.mockResolvedValue([{ total: '1', nonzero: '1' }]);
+
+      const res = await run();
+
+      expect(res._status).toBe(200);
+      expect(optionChainsCalled()).toBe(false);
+      expect(res._json).toMatchObject({
+        rootEvidence: 'not_needed',
+        meanCollisions: 0,
+      });
+    });
+
+    it('sums a collision on a dual-root expiry without raising Sentry', async () => {
+      const { Sentry } = await import('../_lib/sentry.js');
+      stubUwFeeds(
+        [
+          makeStrikeRow('6800', '6105.1409', '-699.9181'),
+          makeStrikeRow('6800', '2201.0002', '-699.9181'),
+        ],
+        // Both roots list the expiry → genuine AM/PM merge → sum.
+        ['SPX260410P06800000', 'SPXW260410C06800000'],
+      );
+      mockSql.mockResolvedValue([{ total: '1', nonzero: '1' }]);
+      const captured = captureInsertValues();
+
+      const res = await run();
+
+      expect(res._status).toBe(200);
+      expect(optionChainsCalled()).toBe(true);
+      const summedCallGex = 6105.1409 + 2201.0002;
+      expect(
+        captured.values.some(
+          (v) =>
+            typeof v === 'string' &&
+            Math.abs(Number.parseFloat(v) - summedCallGex) < 1e-6,
+        ),
+      ).toBe(true);
+      expect(captured.values).toContain('sum');
+      expect(captured.values).not.toContain('mean');
+      expect(Sentry.captureException).not.toHaveBeenCalled();
+      expect(res._json).toMatchObject({
+        dedupeRule: 'sum',
+        rootEvidence: 'applied',
+        meanCollisions: 0,
+      });
+    });
+
+    it('keeps the plain warn for a near-identical pair under applied evidence', async () => {
+      const { Sentry } = await import('../_lib/sentry.js');
+      const { default: logger } = await import('../_lib/logger.js');
+      stubUwFeeds(
+        [
+          makeStrikeRow('6800', '1000.0000', '-100.0000'),
+          makeStrikeRow('6800', '1010.0000', '-100.0000'),
+        ],
+        // Both roots list the expiry, so the close pair is a confirmed AM/PM
+        // merge that happens to be close — summed and warned, not escalated.
+        ['SPX260410P06800000', 'SPXW260410C06800000'],
+      );
+      mockSql.mockResolvedValue([{ total: '1', nonzero: '1' }]);
+
+      const res = await run();
+
+      expect(res._status).toBe(200);
+      expect(res._json).toMatchObject({
+        dedupeRule: 'sum',
+        rootEvidence: 'applied',
+        sumCollisions: 1,
+        nearIdenticalCollisions: 0,
+        meanCollisions: 0,
+      });
+      expect(Sentry.captureException).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ rootEvidence: 'applied', collisions: 1 }),
+        expect.stringContaining('resolved by named rule'),
+      );
+    });
+
+    it('treats evidence that misses the collided expiry as unavailable', async () => {
+      const { Sentry } = await import('../_lib/sentry.js');
+      stubUwFeeds(
+        [
+          makeStrikeRow('6800', '1000.0000', '-100.0000'),
+          makeStrikeRow('6800', '1010.0000', '-100.0000'),
+        ],
+        // The fetch resolves, but only with symbols for a different expiry —
+        // it cannot say which rule 2026-04-10 needs, so it must not be used.
+        ['SPXW260417C06800000', 'SPX260417P06800000'],
+      );
+      mockSql.mockResolvedValue([{ total: '1', nonzero: '1' }]);
+
+      const res = await run();
+
+      expect(res._status).toBe(200);
+      expect(optionChainsCalled()).toBe(true);
+      expect(res._json).toMatchObject({
+        dedupeRule: 'sum',
+        rootEvidence: 'unavailable',
+        nearIdenticalCollisions: 1,
+        meanCollisions: 0,
+      });
+      expect(Sentry.captureException).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('doubled'),
+        }),
+      );
+    });
+
+    it('averages a collision on a single-root expiry and raises Sentry', async () => {
+      const { Sentry } = await import('../_lib/sentry.js');
+      const { default: logger } = await import('../_lib/logger.js');
+      stubUwFeeds(
+        [
+          makeStrikeRow('6800', '1000.0000', '-100.0000'),
+          makeStrikeRow('6800', '1010.0000', '-100.0000'),
+        ],
+        // Only the SPXW root lists the expiry → snapshot duplicate → mean.
+        ['SPXW260410C06800000', 'SPXW260410P06800000'],
+      );
+      mockSql.mockResolvedValue([{ total: '1', nonzero: '1' }]);
+      const captured = captureInsertValues();
+
+      const res = await run();
+
+      expect(res._status).toBe(200);
+      // (1000 + 1010) / 2, not their sum.
+      expect(captured.values).toContain('1005');
+      expect(captured.values).toContain('mean');
+      expect(Sentry.captureException).toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalled();
+      expect(res._json).toMatchObject({
+        rootEvidence: 'applied',
+        meanCollisions: 1,
+      });
+    });
+
+    it('sums and raises the doubled-gamma alarm when evidence is unavailable', async () => {
+      const { Sentry } = await import('../_lib/sentry.js');
+      stubUwFeeds([
+        makeStrikeRow('6800', '1000.0000', '-100.0000'),
+        makeStrikeRow('6800', '1010.0000', '-100.0000'),
+      ]); // option-chains rejects; the pair is ~1% apart
+      mockSql.mockResolvedValue([{ total: '1', nonzero: '1' }]);
+
+      const res = await run();
+
+      expect(res._status).toBe(200);
+      expect(optionChainsCalled()).toBe(true);
+      expect(res._json).toMatchObject({
+        dedupeRule: 'sum',
+        rootEvidence: 'unavailable',
+        nearIdenticalCollisions: 1,
+        meanCollisions: 0,
+      });
+      expect(Sentry.captureException).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('doubled'),
+        }),
+      );
+    });
+
+    it('keeps the plain warn for a structurally different pair without evidence', async () => {
+      const { Sentry } = await import('../_lib/sentry.js');
+      const { default: logger } = await import('../_lib/logger.js');
+      stubUwFeeds([
+        makeStrikeRow('6800', '1000.0000', '-100.0000'),
+        makeStrikeRow('6800', '130.0000', '-100.0000'),
+      ]); // option-chains rejects; the pair is ~87% apart — AM/PM shaped
+      mockSql.mockResolvedValue([{ total: '1', nonzero: '1' }]);
+
+      const res = await run();
+
+      expect(res._status).toBe(200);
+      expect(res._json).toMatchObject({
+        dedupeRule: 'sum',
+        rootEvidence: 'unavailable',
+        nearIdenticalCollisions: 0,
+        meanCollisions: 0,
+      });
+      expect(Sentry.captureException).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ rootEvidence: 'unavailable' }),
+        expect.stringContaining('resolved by named rule'),
+      );
+    });
+  });
 });

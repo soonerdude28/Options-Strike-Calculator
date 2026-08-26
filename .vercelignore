@@ -53,32 +53,34 @@
 **/.pytest_cache/
 
 # Claude Code plugin installs — ~800 MB of locally-installed skills,
-# resources, and references that don't belong on Vercel. Mirrors the
-# pattern in .gitignore so `vercel deploy` from the CLI ships only
-# what git would ship: the 4 committed SKILL.md files plus the
-# periscope/references/** tree (loaded via `includeFiles` for the
-# api/cron/periscope-playbook.ts function — the auto-playbook was
-# retired in f52db025 and revived as that cron on 2026-08-21).
+# resources, and references that don't belong on Vercel. CLI deploys
+# upload the local working tree, so this filter ships only what the
+# api/cron/periscope-playbook.ts function loads at runtime: the
+# periscope SKILL.md + references/ tree (copied into the bundle by
+# that function's `includeFiles`).
 #
-# Git-triggered deploys never saw this bloat — Vercel clones the
-# tracked git tree directly. CLI deploys upload the local working
-# tree and need this filter explicitly.
+# ── DIRECTORY NEGATIONS MUST NOT END IN "/" ─────────────────────────
+# The Vercel CLI's upload walker (buildFileTree2 → readdir-recursive)
+# passes SLASH-LESS relative paths to the ignore matcher and skips a
+# pruned directory WITHOUT descending. A negation written `!dir/` only
+# matches the string "dir/" — which the walker never produces — so the
+# parent rule pruned `.claude/skills` whole, the negations never fired,
+# and NO skill file was ever uploaded. Result: SKILL.md ENOENT on every
+# production run of the playbook cron (64/64 rows failed) while
+# git-semantics tools said the file was included. Pinned by
+# api/__tests__/vercelignore-upload.test.ts, which replays the CLI's
+# walk against this file.
+#
+# .claude/skills/upstash-* are SYMLINKS into .agents/ and must stay
+# pruned — the includeFiles glob resolving through them aborts the
+# build ("File .agents/skills/... does not exist").
 /.claude/*
-!/.claude/skills/
+!/.claude/skills
 /.claude/skills/*
-!/.claude/skills/charm-pressure/
-!/.claude/skills/delta-pressure/
-!/.claude/skills/gamma/
-!/.claude/skills/periscope/
-/.claude/skills/charm-pressure/*
-/.claude/skills/delta-pressure/*
-/.claude/skills/gamma/*
+!/.claude/skills/periscope
 /.claude/skills/periscope/*
-!/.claude/skills/charm-pressure/SKILL.md
-!/.claude/skills/delta-pressure/SKILL.md
-!/.claude/skills/gamma/SKILL.md
 !/.claude/skills/periscope/SKILL.md
-!/.claude/skills/periscope/references/
+!/.claude/skills/periscope/references
 !/.claude/skills/periscope/references/**
 
 # Test coverage reports — local + CI only

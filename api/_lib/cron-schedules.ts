@@ -430,6 +430,16 @@ export const SCHEDULE_MAP: Record<string, CronMonitorConfig> = {
     maxRuntime: DEFAULT_MAX_RUNTIME,
     failureIssueThreshold: HIGH_FREQ_FAILURE_THRESHOLD,
   },
+  'periscope-daily-report': {
+    // 22:10 UTC weekdays — post-close year-round (18:10 ET in EDT,
+    // 17:10 ET in EST), after periscope-lottery enrichment (21:50) and
+    // capture-flow-regime-daily (21:55) so the report reads their
+    // output. Low-freq daily job → default failure threshold (a single
+    // miss is genuinely significant).
+    schedule: '10 22 * * 1-5',
+    checkinMargin: DEFAULT_MARGIN,
+    maxRuntime: DEFAULT_MAX_RUNTIME,
+  },
   'reconcile-greek-flow-etf': {
     schedule: '0 22 * * 1-5',
     checkinMargin: DEFAULT_MARGIN,

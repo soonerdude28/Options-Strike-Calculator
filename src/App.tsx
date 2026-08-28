@@ -168,6 +168,11 @@ const GammaNodeDetectorPanel = lazy(() =>
     .then((m) => ({ default: m.GammaNodeDetectorPanel }))
     .catch(handleStaleChunk),
 );
+const DailyReportPanel = lazy(() =>
+  import('./components/DailyReport/DailyReportPanel')
+    .then((m) => ({ default: m.DailyReportPanel }))
+    .catch(handleStaleChunk),
+);
 const TrackerSection = lazy(() =>
   import('./components/Tracker')
     .then((m) => ({ default: m.TrackerSection }))
@@ -1214,6 +1219,19 @@ export default function StrikeCalculator() {
           ),
         ],
         [
+          'sec-daily-report',
+          () => (
+            <GatedSection
+              gate={isAuthenticated}
+              id="sec-daily-report"
+              label="Daily Report"
+              fallback={<SkeletonSection lines={6} tall />}
+            >
+              <DailyReportPanel />
+            </GatedSection>
+          ),
+        ],
+        [
           'sec-futures',
           () => (
             <LazySection
@@ -1396,6 +1414,7 @@ export default function StrikeCalculator() {
       historyData.history?.spx,
       historyRefreshKey,
       historySnapshot,
+      isAuthenticated,
       ivMode,
       market,
       multiplier,

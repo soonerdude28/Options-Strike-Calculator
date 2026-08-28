@@ -320,6 +320,10 @@
     {
       "path": "/api/cron/capture-flow-regime-daily",
       "schedule": "55 21 * * 1-5"
+    },
+    {
+      "path": "/api/cron/periscope-daily-report",
+      "schedule": "10 22 * * 1-5"
     }
   ],
   "functions": {

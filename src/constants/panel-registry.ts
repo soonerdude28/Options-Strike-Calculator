@@ -153,6 +153,16 @@ export function getPanelRegistry(
     });
   }
   if (isAuthenticated) {
+    // Auth-only (owner or guest), NOT market-gated: the report is
+    // historical EOD data served from daily_reports, readable any time
+    // — including weekends when there's no live market context.
+    list.push({
+      id: 'sec-daily-report',
+      label: 'Daily Report',
+      group: 'Market Context',
+    });
+  }
+  if (isAuthenticated) {
     list.push(
       {
         id: 'sec-periscope-history',

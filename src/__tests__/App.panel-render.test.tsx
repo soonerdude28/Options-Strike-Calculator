@@ -73,6 +73,7 @@ describe('Default-order panel render contract', () => {
     expect(sequence).not.toContain('sec-tracker');
     expect(sequence).not.toContain('sec-bwb');
     expect(sequence).not.toContain('sec-ml-insights');
+    expect(sequence).not.toContain('sec-daily-report');
     expect(sequence).not.toContain('sec-periscope-history');
     expect(sequence).not.toContain('sec-periscope-lessons');
     // Market-only panels must NOT appear

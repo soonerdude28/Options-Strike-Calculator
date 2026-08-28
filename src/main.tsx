@@ -152,6 +152,7 @@ if (import.meta.env.PROD)
       { path: '/api/periscope-exposure', method: 'GET' },
       { path: '/api/periscope-map', method: 'GET' },
       { path: '/api/periscope-strikes', method: 'GET' },
+      { path: '/api/daily-report', method: 'GET' },
       { path: '/api/pin-setup-status', method: 'GET' },
       { path: '/api/ml/trigger-analyze', method: 'POST' },
       { path: '/api/darkpool-levels', method: 'GET' },

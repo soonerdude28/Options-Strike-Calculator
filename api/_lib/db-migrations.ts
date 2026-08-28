@@ -5376,4 +5376,21 @@ export const MIGRATIONS: Migration[] = [
       `,
     ],
   },
+  {
+    id: 195,
+    description:
+      'Create daily_reports table for the Periscope Daily Report (docs/superpowers/specs/periscope-daily-report-2026-08-27.md). One row per trading day, written by the periscope-daily-report cron at 22:10 UTC after the close: `report` holds the full assembled DailyReport JSON (session OHLC + cone verdict, latest auto playbook, dealer positioning, flow closes, tape and signal scoreboards, data-quality footer) so the GET endpoint and the app panel read ONE row instead of re-aggregating seven source tables whose retention windows differ — ws_option_trades in particular is pruned at T+2 by cleanup-ws-option-trades, so the tape section is unrecoverable unless it is materialized here on the day it happened. `date` is the PK (one report per session; the cron UPSERTs via ON CONFLICT (date) DO UPDATE so a re-run refreshes rather than duplicates). push_sent + push_result record the web-push fan-out outcome separately from the report content, so a failed push never blocks — or is hidden by — a successfully built report, and the cron can tell "report built, push failed" from "never ran". JSONB rather than typed columns because the report shape is owned and versioned by buildDailyReport (sections fail SOFT to null with a note) and the panel renders whatever sections are present; a column-per-field schema would turn every report-shape iteration into a migration.',
+    statements: (sql) => [
+      sql`
+        CREATE TABLE IF NOT EXISTS daily_reports (
+          date        DATE PRIMARY KEY,
+          report      JSONB NOT NULL,
+          push_sent   BOOLEAN NOT NULL DEFAULT FALSE,
+          push_result JSONB,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `,
+    ],
+  },
 ];

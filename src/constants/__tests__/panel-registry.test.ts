@@ -33,6 +33,7 @@ describe('getPanelRegistry', () => {
     expect(ids).toContain('sec-charts');
     expect(ids).toContain('sec-periscope-exposure');
     // auth-only panels still excluded
+    expect(ids).not.toContain('sec-daily-report');
     expect(ids).not.toContain('sec-futures');
     expect(ids).not.toContain('sec-bwb');
     expect(ids).not.toContain('sec-tracker');
@@ -47,6 +48,7 @@ describe('getPanelRegistry', () => {
 
     expect(ids).toContain('sec-futures');
     expect(ids).toContain('sec-ml-insights');
+    expect(ids).toContain('sec-daily-report');
     expect(ids).toContain('sec-periscope-history');
     expect(ids).toContain('sec-periscope-lessons');
     expect(ids).toContain('sec-tracker');
@@ -92,6 +94,7 @@ describe('getPanelRegistry', () => {
       'sec-history',
       'sec-ml-insights',
       'sec-periscope-exposure',
+      'sec-daily-report',
       'sec-periscope-history',
       'sec-periscope-lessons',
       'sec-positions',
